@@ -54,8 +54,11 @@ pub fn runTaskWithTools(
 
     const tools = try tools_mod.subagentTools(allocator, request.workspace_dir, .{
         .http_enabled = request.http_enabled,
+        .http_allowed_domains = request.http_allowed_domains,
+        .http_max_response_size = request.http_max_response_size,
         .allowed_paths = request.allowed_paths,
         .policy = &policy,
+        .tools_config = request.tools_config,
     });
     defer tools_mod.deinitTools(allocator, tools);
 
@@ -82,7 +85,10 @@ pub fn runTaskWithTools(
         },
         .http_request = .{
             .enabled = request.http_enabled,
+            .allowed_domains = request.http_allowed_domains,
+            .max_response_size = request.http_max_response_size,
         },
+        .tools = request.tools_config,
     };
 
     var noop_obs = observability.NoopObserver{};

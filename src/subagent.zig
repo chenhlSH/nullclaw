@@ -47,6 +47,9 @@ pub const TaskRunRequest = struct {
     workspace_dir: []const u8,
     allowed_paths: []const []const u8,
     http_enabled: bool,
+    http_allowed_domains: []const []const u8,
+    http_max_response_size: u32,
+    tools_config: config_types.ToolsConfig,
     max_tool_iterations: u32,
     autonomy: config_types.AutonomyLevel,
     workspace_only: bool,
@@ -96,6 +99,9 @@ pub const SubagentManager = struct {
     block_high_risk_commands: bool,
     configured_providers: []const config_types.ProviderEntry,
     http_enabled: bool,
+    http_allowed_domains: []const []const u8,
+    http_max_response_size: u32,
+    tools_config: config_types.ToolsConfig,
     task_runner: ?TaskRunnerFn = null,
 
     pub fn init(
@@ -125,6 +131,9 @@ pub const SubagentManager = struct {
             .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
             .configured_providers = cfg.providers,
             .http_enabled = cfg.http_request.enabled,
+            .http_allowed_domains = cfg.http_request.allowed_domains,
+            .http_max_response_size = cfg.http_request.max_response_size,
+            .tools_config = cfg.tools,
         };
     }
 
@@ -325,10 +334,13 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         ctx.manager.allocator.destroy(ctx);
     }
 
-    // Use the legacy complete path — simple, works with any provider,
-    // no need to replicate the full ProviderHolder pattern.
-    // Build a config-like struct for providers.completeWithSystem().
-    var system_prompt: []const u8 = "You are a background subagent. Complete the assigned task concisely and accurately. You have no access to interactive tools — focus on reasoning and analysis.";
+    // Default prompt differs based on execution mode:
+    // - tool-loop mode can use restricted tools
+    // - legacy fallback has no tool access
+    var system_prompt: []const u8 = if (ctx.manager.task_runner != null)
+        "You are a background subagent. Complete the assigned task concisely and accurately. Use available tools when they materially improve correctness."
+    else
+        "You are a background subagent. Complete the assigned task concisely and accurately. You have no access to interactive tools — focus on reasoning and analysis.";
     var api_key = ctx.manager.api_key;
     var default_provider = ctx.manager.default_provider;
     var default_model = ctx.manager.default_model;
@@ -358,6 +370,9 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
             .workspace_dir = ctx.manager.workspace_dir,
             .allowed_paths = ctx.manager.allowed_paths,
             .http_enabled = ctx.manager.http_enabled,
+            .http_allowed_domains = ctx.manager.http_allowed_domains,
+            .http_max_response_size = ctx.manager.http_max_response_size,
+            .tools_config = ctx.manager.tools_config,
             .max_tool_iterations = ctx.manager.config.max_iterations,
             .autonomy = ctx.manager.autonomy,
             .workspace_only = ctx.manager.workspace_only,
