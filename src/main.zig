@@ -1116,6 +1116,7 @@ const OnboardArgs = struct {
     mode: OnboardMode = .quick,
     api_key: ?[]const u8 = null,
     provider: ?[]const u8 = null,
+    model: ?[]const u8 = null,
     memory_backend: ?[]const u8 = null,
 };
 
@@ -1155,6 +1156,12 @@ fn parseOnboardArgs(sub_args: []const []const u8) OnboardArgParseResult {
             parsed.provider = sub_args[i];
             continue;
         }
+        if (std.mem.eql(u8, arg, "--model")) {
+            if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
+            i += 1;
+            parsed.model = sub_args[i];
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--memory")) {
             if (i + 1 >= sub_args.len) return .{ .missing_value = arg };
             i += 1;
@@ -1179,7 +1186,7 @@ fn parseOnboardArgs(sub_args: []const []const u8) OnboardArgParseResult {
 
 fn printOnboardUsage() void {
     std.debug.print(
-        \\Usage: nullclaw onboard [--interactive | --channels-only | [--api-key KEY] [--provider PROV] [--memory MEM]]
+        \\Usage: nullclaw onboard [--interactive | --channels-only | [--api-key KEY] [--provider PROV] [--model MODEL] [--memory MEM]]
         \\
         \\Modes:
         \\  (default)         quick setup
@@ -1188,11 +1195,13 @@ fn printOnboardUsage() void {
         \\
         \\Quick setup options:
         \\  --api-key KEY     provider API key to persist in config
-        \\  --provider PROV   default provider key (e.g. openrouter, anthropic)
+        \\  --provider PROV   default provider key (e.g. openrouter, anthropic, custom:https://...)
+        \\  --model MODEL     default model for the provider (e.g. gpt-5.2, claude-opus-4-6)
         \\  --memory MEM      memory backend key (e.g. markdown, sqlite, memory)
         \\
         \\Examples:
         \\  nullclaw onboard --api-key sk-... --provider openrouter
+        \\  nullclaw onboard --api-key sk-... --provider custom:https://api.example.com/v1 --model minimaxai/minimax-m2.1
         \\  nullclaw onboard --interactive
         \\
     , .{});
@@ -1251,7 +1260,7 @@ fn runOnboard(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     switch (parsed.mode) {
         .channels_only => try yc.onboard.runChannelsOnly(allocator),
         .interactive => try yc.onboard.runWizard(allocator),
-        .quick => yc.onboard.runQuickSetup(allocator, parsed.api_key, parsed.provider, parsed.memory_backend) catch |err| switch (err) {
+        .quick => yc.onboard.runQuickSetup(allocator, parsed.api_key, parsed.provider, parsed.model, parsed.memory_backend) catch |err| switch (err) {
             error.UnknownProvider => {
                 const requested = parsed.provider orelse "(missing)";
                 std.debug.print("Unknown provider '{s}' for quick setup.\n", .{requested});
@@ -2498,7 +2507,7 @@ fn printUsage() void {
         \\  help        Show this help
         \\
         \\OPTIONS:
-        \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--memory MEM]
+        \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--model MODEL] [--memory MEM]
         \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
         \\  gateway [--port PORT] [--host HOST]
         \\  version | --version | -V
