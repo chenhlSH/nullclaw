@@ -36,6 +36,10 @@ pub const SandboxBackend = enum {
 
 pub const ProviderEntry = struct {
     name: []const u8,
+    /// Provider credential payload.
+    /// Usually a string API key/token.
+    /// For providers that support structured credentials (e.g. Vertex service-account JSON),
+    /// the parser accepts object/array JSON and stores it as a compact JSON string.
     api_key: ?[]const u8 = null,
     base_url: ?[]const u8 = null,
     /// Whether this provider supports native OpenAI-style tool_calls.
@@ -139,6 +143,32 @@ pub const SchedulerConfig = struct {
     agent_timeout_secs: u64 = 0,
 };
 
+// ── Tool filter groups ──────────────────────────────────────────
+
+/// Controls which MCP tools are included in the schema sent to the LLM each turn.
+///
+/// Two modes:
+///   - `always`:  tools matching `tools` patterns are always included (no keywords needed).
+///   - `dynamic`: tools matching `tools` patterns are included only when the user message
+///                contains at least one of the `keywords` (case-insensitive substring match).
+///
+/// Built-in (non-MCP) tools are always included regardless of filter groups.
+/// If no filter groups are configured, all tools pass through unchanged.
+pub const ToolFilterGroupMode = enum {
+    always,
+    dynamic,
+};
+
+pub const ToolFilterGroup = struct {
+    mode: ToolFilterGroupMode,
+    /// Glob patterns matched against tool names (e.g. "mcp_vikunja_*").
+    /// Supports `*` wildcard only (prefix/suffix/infix).
+    tools: []const []const u8 = &.{},
+    /// Keywords for `dynamic` mode — case-insensitive substring match against user message.
+    /// Ignored when mode is `always`.
+    keywords: []const []const u8 = &.{},
+};
+
 pub const AgentConfig = struct {
     compact_context: bool = false,
     max_tool_iterations: u32 = 1000,
@@ -157,6 +187,9 @@ pub const AgentConfig = struct {
     status_show_emojis: bool = true,
     /// Max seconds to wait for an LLM HTTP response (curl --max-time). 0 = no limit.
     message_timeout_secs: u64 = 600,
+    /// Per-turn MCP tool filtering. Empty slice = no filtering (all tools included).
+    /// See ToolFilterGroup for semantics.
+    tool_filter_groups: []const ToolFilterGroup = &.{},
 };
 
 pub const ToolsConfig = struct {
@@ -693,6 +726,8 @@ pub const ChannelsConfig = struct {
 
 /// Memory configuration profile presets.
 pub const MemoryProfile = enum {
+    /// Hybrid: SQLite backend with workspace bootstrap files.
+    hybrid_keyword,
     /// SQLite keyword-only (default).
     local_keyword,
     /// File-based markdown memory.
@@ -709,6 +744,7 @@ pub const MemoryProfile = enum {
     custom,
 
     pub fn fromString(s: []const u8) MemoryProfile {
+        if (std.mem.eql(u8, s, "hybrid_keyword")) return .hybrid_keyword;
         if (std.mem.eql(u8, s, "local_keyword")) return .local_keyword;
         if (std.mem.eql(u8, s, "markdown_only")) return .markdown_only;
         if (std.mem.eql(u8, s, "postgres_keyword")) return .postgres_keyword;
@@ -720,11 +756,12 @@ pub const MemoryProfile = enum {
 };
 
 pub const MemoryConfig = struct {
-    pub const DEFAULT_MEMORY_BACKEND: []const u8 = "markdown";
+    pub const DEFAULT_MEMORY_BACKEND: []const u8 = "hybrid";
 
     /// Profile preset — convenience shortcut for common setups.
-    profile: []const u8 = "markdown_only",
+    profile: []const u8 = "hybrid_keyword",
     backend: []const u8 = DEFAULT_MEMORY_BACKEND,
+    instance_id: []const u8 = "",
     auto_save: bool = true,
     citations: []const u8 = "auto",
     search: MemorySearchConfig = .{},
@@ -743,6 +780,9 @@ pub const MemoryConfig = struct {
     pub fn applyProfileDefaults(self: *MemoryConfig) void {
         const p = MemoryProfile.fromString(self.profile);
         switch (p) {
+            .hybrid_keyword => {
+                // Base default is already hybrid.
+            },
             .local_keyword => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
             },
@@ -899,6 +939,7 @@ pub const MemoryLifecycleConfig = struct {
     hygiene_enabled: bool = true,
     archive_after_days: u32 = 7,
     purge_after_days: u32 = 30,
+    preserve_before_purge: bool = true,
     conversation_retention_days: u32 = 30,
     snapshot_enabled: bool = false,
     snapshot_on_hygiene: bool = false,
