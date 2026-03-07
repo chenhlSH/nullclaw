@@ -1,6 +1,37 @@
 # NullClaw 中文文档
 
-本目录提供 NullClaw 的中文使用文档，覆盖安装、配置、运行与排障。
+本目录提供面向使用者、运维者、贡献者的中文文档入口。
+
+如果你刚接触 NullClaw，先从这里找对阅读路径，再进入具体章节。
+
+## 从哪开始
+
+### 1. 我只想先跑起来
+
+推荐顺序：
+
+1. [安装指南](./installation.md)
+2. [配置指南](./configuration.md)
+3. [使用与运维](./usage.md)
+4. [命令参考](./commands.md)
+
+### 2. 我要部署和长期运行
+
+重点看：
+
+- [使用与运维](./usage.md)
+- [安全机制](./security.md)
+- [Gateway API](./gateway-api.md)
+- [Signal 部署专题](../../SIGNAL.md)
+
+### 3. 我要开发、改代码、提 PR
+
+重点看：
+
+- [架构总览](./architecture.md)
+- [开发指南](./development.md)
+- [命令参考](./commands.md)
+- [贡献指南](../../CONTRIBUTING.md)
 
 ## 文档导航
 
@@ -28,3 +59,31 @@ nullclaw agent -m "你好，nullclaw"
 ```
 
 如果你不用 Homebrew，请按 [安装指南](./installation.md) 走源码构建流程。
+
+## 推荐阅读顺序
+
+### 新用户
+
+1. [安装指南](./installation.md)
+2. [配置指南](./configuration.md)
+3. [使用与运维](./usage.md)
+4. [命令参考](./commands.md)
+
+### 运维 / 集成
+
+1. [使用与运维](./usage.md)
+2. [安全机制](./security.md)
+3. [Gateway API](./gateway-api.md)
+4. [Signal 部署专题](../../SIGNAL.md)
+
+### 贡献者
+
+1. [架构总览](./architecture.md)
+2. [开发指南](./development.md)
+3. [贡献指南](../../CONTRIBUTING.md)
+
+## 专题文档
+
+- [安全披露流程](../../SECURITY.md)
+- [Signal 渠道部署](../../SIGNAL.md)
+- [贡献指南](../../CONTRIBUTING.md)
