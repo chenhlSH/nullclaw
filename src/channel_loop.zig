@@ -23,6 +23,7 @@ const subagent_mod = @import("subagent.zig");
 const subagent_runner = @import("subagent_runner.zig");
 const agent_routing = @import("agent_routing.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
+const thread_stacks = @import("thread_stacks.zig");
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
@@ -732,7 +733,7 @@ pub fn runTelegramLoop(
                         .message_sender_id = task_message_sender_id,
                     };
 
-                    const thread = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, messageTaskWorker, .{task}) catch |err| {
+                    const thread = std.Thread.spawn(.{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE }, messageTaskWorker, .{task}) catch |err| {
                         log.err("Failed to spawn worker thread: {}, falling back to synchronous", .{err});
                         task.deinit();
                         allocator.destroy(task);
@@ -993,7 +994,7 @@ pub fn spawnTelegramPolling(
 
     const tg_ptr: *telegram.TelegramChannel = @ptrCast(@alignCast(channel.ptr));
     const thread = try std.Thread.spawn(
-        .{ .stack_size = 2 * 1024 * 1024 },
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
         runTelegramLoop,
         .{ allocator, config, runtime, tg_ls, tg_ptr },
     );
@@ -1017,7 +1018,7 @@ pub fn spawnSignalPolling(
 
     const sg_ptr: *signal.SignalChannel = @ptrCast(@alignCast(channel.ptr));
     const thread = try std.Thread.spawn(
-        .{ .stack_size = 2 * 1024 * 1024 },
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
         runSignalLoop,
         .{ allocator, config, runtime, sg_ls, sg_ptr },
     );
@@ -1041,7 +1042,7 @@ pub fn spawnMatrixPolling(
 
     const mx_ptr: *matrix.MatrixChannel = @ptrCast(@alignCast(channel.ptr));
     const thread = try std.Thread.spawn(
-        .{ .stack_size = 2 * 1024 * 1024 },
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
         runMatrixLoop,
         .{ allocator, config, runtime, mx_ls, mx_ptr },
     );
