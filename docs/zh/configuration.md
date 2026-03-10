@@ -95,6 +95,26 @@ nullclaw onboard --interactive
 - 设置默认模型路由，格式通常为：`provider/vendor/model`。
 - 示例：`openrouter/anthropic/claude-sonnet-4`
 
+### `agents.list`
+
+- 定义可供 `/delegate` 等工具使用的命名 agent 配置。
+- 每个条目既可以显式写 `provider` + `model`，也可以直接在 `model.primary` 中写完整的 `provider/model` 引用。
+- 示例：
+
+```json
+{
+  "agents": {
+    "list": [
+      {
+        "id": "coder",
+        "model": { "primary": "ollama/qwen3.5:cloud" },
+        "system_prompt": "You're an experienced coder"
+      }
+    ]
+  }
+}
+```
+
 ### `channels`
 
 - 渠道配置统一在 `channels.<name>` 下。
@@ -170,7 +190,7 @@ Telegram 示例：
 
 注意：
 
-- `search_base_url` 必须是合法 URL，否则启动校验会失败。
+- `search_base_url` 必须是 `https://host[/search]`，或者本地/内网可达的 `http://host[:port][/search]`，否则启动校验会失败。
 - `allowed_commands: ["*"]` 与 `allowed_paths: ["*"]` 会显著扩大执行范围。
 
 ## 配置变更后的验证

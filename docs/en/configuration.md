@@ -109,6 +109,26 @@ Example:
 - Sets default model route, typically `provider/vendor/model`.
 - Example: `openrouter/anthropic/claude-sonnet-4`
 
+### `agents.list`
+
+- Defines named agent profiles used by tools such as `/delegate`.
+- Each entry may set `provider` + `model`, or a full `provider/model` ref in `model.primary`.
+- Example:
+
+```json
+{
+  "agents": {
+    "list": [
+      {
+        "id": "coder",
+        "model": { "primary": "ollama/qwen3.5:cloud" },
+        "system_prompt": "You're an experienced coder"
+      }
+    ]
+  }
+}
+```
+
 ### `channels`
 
 - Channel config lives under `channels.<name>`.
@@ -186,7 +206,7 @@ Use only in controlled environments:
 
 Notes:
 
-- `search_base_url` must be a valid URL, otherwise startup validation fails.
+- `search_base_url` must be `https://host[/search]` or a local/private `http://host[:port][/search]` URL, otherwise startup validation fails.
 - `allowed_commands: ["*"]` and `allowed_paths: ["*"]` significantly widen execution scope.
 
 ## Validate After Config Changes
