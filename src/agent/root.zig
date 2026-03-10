@@ -870,6 +870,64 @@ pub const Agent = struct {
         return @tagName(route.quota_class);
     }
 
+    fn routeMetadataScoreNudge(route: config_types.ModelRouteConfig) i32 {
+        const cost_nudge: i32 = switch (route.cost_class) {
+            .free => 8,
+            .cheap => 4,
+            .standard => 0,
+            .premium => -4,
+        };
+        const quota_nudge: i32 = switch (route.quota_class) {
+            .unlimited => 6,
+            .normal => 0,
+            .constrained => -6,
+        };
+        return cost_nudge + quota_nudge;
+    }
+
+    fn routeTiePriority(hint: []const u8) u8 {
+        if (std.mem.eql(u8, hint, "balanced")) return 0;
+        if (std.mem.eql(u8, hint, "fast")) return 1;
+        if (std.mem.eql(u8, hint, "deep")) return 2;
+        if (std.mem.eql(u8, hint, "reasoning")) return 3;
+        if (std.mem.eql(u8, hint, "vision")) return 4;
+        return 255;
+    }
+
+    fn maybePromoteRoute(best: *?RouteSelection, candidate: RouteSelection) void {
+        if (best.*) |current| {
+            if (candidate.score < current.score) return;
+            if (candidate.score == current.score and routeTiePriority(candidate.hint) >= routeTiePriority(current.hint)) {
+                return;
+            }
+        }
+        best.* = candidate;
+    }
+
+    fn firstMatchingKeyword(haystack: []const u8, keywords: []const []const u8) ?[]const u8 {
+        for (keywords) |keyword| {
+            if (containsAsciiIgnoreCase(haystack, keyword)) return keyword;
+        }
+        return null;
+    }
+
+    fn isAmbiguousPrompt(user_message: []const u8) bool {
+        const ambiguous_keywords = [_][]const u8{
+            "what should",
+            "should we",
+            "should i",
+            "what do you think",
+            "thoughts",
+            "advice",
+            "not sure",
+            "unclear",
+        };
+        inline for (ambiguous_keywords) |keyword| {
+            if (containsAsciiIgnoreCase(user_message, keyword)) return true;
+        }
+        return user_message.len <= 220 and std.mem.indexOfScalar(u8, user_message, '?') != null;
+    }
+
     fn activeDegradedRouteForStatus(
         self: *const Agent,
         route: config_types.ModelRouteConfig,
@@ -886,7 +944,7 @@ pub const Agent = struct {
         route: config_types.ModelRouteConfig,
         reason: []const u8,
         matched_keyword: ?[]const u8 = null,
-        score: ?i32 = null,
+        score: i32 = 0,
     };
 
     const DegradedRoute = struct {
@@ -908,6 +966,7 @@ pub const Agent = struct {
         hint: []const u8,
         reason: []const u8,
         matched_keyword: ?[]const u8,
+        score: i32,
         now_ms: i64,
     ) ?RouteSelection {
         const route = self.findUsableModelRouteByHint(hint, now_ms) orelse return null;
@@ -916,6 +975,7 @@ pub const Agent = struct {
             .route = route,
             .reason = reason,
             .matched_keyword = matched_keyword,
+            .score = score,
         };
     }
 
@@ -982,35 +1042,19 @@ pub const Agent = struct {
         defer self.allocator.free(route_ref);
 
         if (selection.matched_keyword) |keyword| {
-            if (selection.score) |score| {
-                self.last_route_trace = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{s} -> {s} ({s}: \"{s}\"; score {d})",
-                    .{ selection.hint, route_ref, selection.reason, keyword, score },
-                );
-            } else {
-                self.last_route_trace = try std.fmt.allocPrint(
-                    self.allocator,
-                    "{s} -> {s} ({s}: \"{s}\")",
-                    .{ selection.hint, route_ref, selection.reason, keyword },
-                );
-            }
+            self.last_route_trace = try std.fmt.allocPrint(
+                self.allocator,
+                "{s} -> {s} ({s}: \"{s}\"; score {d})",
+                .{ selection.hint, route_ref, selection.reason, keyword, selection.score },
+            );
             return;
         }
 
-        if (selection.score) |score| {
-            self.last_route_trace = try std.fmt.allocPrint(
-                self.allocator,
-                "{s} -> {s} ({s}; score {d})",
-                .{ selection.hint, route_ref, selection.reason, score },
-            );
-        } else {
-            self.last_route_trace = try std.fmt.allocPrint(
-                self.allocator,
-                "{s} -> {s} ({s})",
-                .{ selection.hint, route_ref, selection.reason },
-            );
-        }
+        self.last_route_trace = try std.fmt.allocPrint(
+            self.allocator,
+            "{s} -> {s} ({s}; score {d})",
+            .{ selection.hint, route_ref, selection.reason, selection.score },
+        );
     }
 
     fn selectRouteHintForTurn(self: *Agent, user_message: []const u8) ?[]const u8 {
@@ -1027,6 +1071,7 @@ pub const Agent = struct {
                 "vision",
                 "image input with configured vision route",
                 null,
+                100,
                 now_ms,
             );
         }
@@ -1047,36 +1092,6 @@ pub const Agent = struct {
             "why does",
             "why is",
         };
-        inline for (deep_keywords) |keyword| {
-            if (containsAsciiIgnoreCase(user_message, keyword)) {
-                if (self.hasUsableModelRouteHint("deep", now_ms)) {
-                    return self.routeSelectionForHint("deep", "matched deep-task keyword", keyword, now_ms);
-                }
-                if (self.hasUsableModelRouteHint("reasoning", now_ms)) {
-                    return self.routeSelectionForHint("reasoning", "matched deep-task keyword", keyword, now_ms);
-                }
-            }
-        }
-
-        if (user_message.len > 600 or self.history.items.len >= 24) {
-            if (self.hasUsableModelRouteHint("deep", now_ms)) {
-                return self.routeSelectionForHint(
-                    "deep",
-                    "long prompt or deep conversation context",
-                    null,
-                    now_ms,
-                );
-            }
-            if (self.hasUsableModelRouteHint("reasoning", now_ms)) {
-                return self.routeSelectionForHint(
-                    "reasoning",
-                    "long prompt or deep conversation context",
-                    null,
-                    now_ms,
-                );
-            }
-        }
-
         const fast_keywords = [_][]const u8{
             "status",
             "list",
@@ -1103,39 +1118,106 @@ pub const Agent = struct {
             "yes or no",
             "true or false",
         };
-        if (user_message.len <= 120) {
-            inline for (fast_keywords) |keyword| {
-                if (containsAsciiIgnoreCase(user_message, keyword) and self.hasUsableModelRouteHint("fast", now_ms)) {
-                    return self.routeSelectionForHint("fast", "matched fast-task keyword", keyword, now_ms);
-                }
+
+        const deep_keyword = firstMatchingKeyword(user_message, &deep_keywords);
+        const fast_keyword = if (user_message.len <= 120) firstMatchingKeyword(user_message, &fast_keywords) else null;
+        const structured_fast_keyword = if (user_message.len <= 220)
+            firstMatchingKeyword(user_message, &structured_fast_keywords)
+        else
+            null;
+        const long_context = user_message.len > 600 or self.history.items.len >= 24;
+        const ambiguous_prompt = isAmbiguousPrompt(user_message);
+
+        var best: ?RouteSelection = null;
+
+        if (self.findUsableModelRouteByHint("fast", now_ms)) |route| {
+            var fast_score: i32 = 12 + routeMetadataScoreNudge(route);
+            var fast_reason: []const u8 = "fallback fast route";
+            var fast_matched_keyword: ?[]const u8 = null;
+            if (fast_keyword) |keyword| {
+                fast_score += 45;
+                fast_reason = "high-confidence short operational prompt";
+                fast_matched_keyword = keyword;
             }
-        }
-        if (user_message.len <= 220) {
-            inline for (structured_fast_keywords) |keyword| {
-                if (containsAsciiIgnoreCase(user_message, keyword) and self.hasUsableModelRouteHint("fast", now_ms)) {
-                    return self.routeSelectionForHint(
-                        "fast",
-                        "matched structured fast-task keyword",
-                        keyword,
-                        now_ms,
-                    );
-                }
+            if (structured_fast_keyword) |keyword| {
+                fast_score += 55;
+                fast_reason = "high-confidence structured prompt";
+                fast_matched_keyword = keyword;
             }
+            if (long_context) fast_score -= 15;
+            maybePromoteRoute(&best, .{
+                .hint = "fast",
+                .route = route,
+                .reason = fast_reason,
+                .matched_keyword = fast_matched_keyword,
+                .score = fast_score,
+            });
         }
 
-        if (self.hasUsableModelRouteHint("balanced", now_ms)) {
-            return self.routeSelectionForHint("balanced", "default balanced route", null, now_ms);
+        if (self.findUsableModelRouteByHint("balanced", now_ms)) |route| {
+            var balanced_score: i32 = 30 + routeMetadataScoreNudge(route);
+            var balanced_reason: []const u8 = "default balanced route";
+            if (ambiguous_prompt) {
+                balanced_score += 12;
+                balanced_reason = "ambiguous prompt kept on balanced route";
+            }
+            if (deep_keyword != null) balanced_score -= 10;
+            if (structured_fast_keyword != null or fast_keyword != null) balanced_score -= 8;
+            maybePromoteRoute(&best, .{
+                .hint = "balanced",
+                .route = route,
+                .reason = balanced_reason,
+                .score = balanced_score,
+            });
         }
-        if (self.hasUsableModelRouteHint("fast", now_ms)) {
-            return self.routeSelectionForHint("fast", "fallback fast route", null, now_ms);
+
+        if (self.findUsableModelRouteByHint("deep", now_ms)) |route| {
+            var deep_score: i32 = 10 + routeMetadataScoreNudge(route);
+            var deep_reason: []const u8 = "fallback deep route";
+            var deep_matched_keyword: ?[]const u8 = null;
+            if (deep_keyword) |keyword| {
+                deep_score += 50;
+                deep_reason = "matched deep-task keyword";
+                deep_matched_keyword = keyword;
+            }
+            if (long_context) {
+                deep_score += 35;
+                if (deep_matched_keyword == null) deep_reason = "long prompt or deep conversation context";
+            }
+            if (user_message.len <= 120 and deep_keyword == null) deep_score -= 4;
+            maybePromoteRoute(&best, .{
+                .hint = "deep",
+                .route = route,
+                .reason = deep_reason,
+                .matched_keyword = deep_matched_keyword,
+                .score = deep_score,
+            });
         }
-        if (self.hasUsableModelRouteHint("deep", now_ms)) {
-            return self.routeSelectionForHint("deep", "fallback deep route", null, now_ms);
+
+        if (self.findUsableModelRouteByHint("reasoning", now_ms)) |route| {
+            var reasoning_score: i32 = 8 + routeMetadataScoreNudge(route);
+            var reasoning_reason: []const u8 = "fallback reasoning route";
+            var reasoning_matched_keyword: ?[]const u8 = null;
+            if (deep_keyword) |keyword| {
+                reasoning_score += 45;
+                reasoning_reason = "matched deep-task keyword";
+                reasoning_matched_keyword = keyword;
+            }
+            if (long_context) {
+                reasoning_score += 30;
+                if (reasoning_matched_keyword == null) reasoning_reason = "long prompt or deep conversation context";
+            }
+            if (user_message.len <= 120 and deep_keyword == null) reasoning_score -= 4;
+            maybePromoteRoute(&best, .{
+                .hint = "reasoning",
+                .route = route,
+                .reason = reasoning_reason,
+                .matched_keyword = reasoning_matched_keyword,
+                .score = reasoning_score,
+            });
         }
-        if (self.hasUsableModelRouteHint("reasoning", now_ms)) {
-            return self.routeSelectionForHint("reasoning", "fallback reasoning route", null, now_ms);
-        }
-        return null;
+
+        return best;
     }
 
     fn routeModelNameForTurn(self: *Agent, allocator: std.mem.Allocator, user_message: []const u8) !?[]u8 {
@@ -4186,9 +4268,9 @@ test "auto route selects fast model for short structured prompt" {
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
     agent.model_routes = &.{
-        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b" },
-        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
-        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4" },
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b", .cost_class = .free, .quota_class = .unlimited },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4", .cost_class = .standard, .quota_class = .normal },
+        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4", .cost_class = .premium, .quota_class = .constrained },
     };
 
     const routed = (try agent.routeModelNameForTurn(
@@ -4205,9 +4287,9 @@ test "auto route keeps ambiguous short prompt on balanced model" {
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
     agent.model_routes = &.{
-        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b" },
-        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
-        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4" },
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b", .cost_class = .free, .quota_class = .unlimited },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4", .cost_class = .premium, .quota_class = .constrained },
+        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4", .cost_class = .premium, .quota_class = .constrained },
     };
 
     const routed = (try agent.routeModelNameForTurn(allocator, "What should we do here?")).?;
@@ -4221,9 +4303,9 @@ test "auto route selects deep model for investigation prompt" {
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
     agent.model_routes = &.{
-        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b" },
-        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
-        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4" },
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b", .cost_class = .free, .quota_class = .unlimited },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4", .cost_class = .standard, .quota_class = .normal },
+        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4", .cost_class = .premium, .quota_class = .constrained },
     };
 
     const routed = (try agent.routeModelNameForTurn(
@@ -4265,7 +4347,11 @@ test "auto route records last route trace for short structured prompt" {
     try std.testing.expectEqualStrings("groq/llama-3.3-8b", routed);
     try std.testing.expect(agent.last_route_trace != null);
     try std.testing.expect(std.mem.indexOf(u8, agent.last_route_trace.?, "fast -> groq/llama-3.3-8b") != null);
-    try std.testing.expect(std.mem.indexOf(u8, agent.last_route_trace.?, "matched") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, agent.last_route_trace.?, "high-confidence") != null or
+            std.mem.indexOf(u8, agent.last_route_trace.?, "structured prompt") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, agent.last_route_trace.?, "score ") != null);
     try std.testing.expect(
         std.mem.indexOf(u8, agent.last_route_trace.?, "\"version\"") != null or
             std.mem.indexOf(u8, agent.last_route_trace.?, "\"extract\"") != null or

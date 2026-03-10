@@ -138,6 +138,7 @@ Notes:
 - If both `deep` and `reasoning` are configured, deep-analysis prompts prefer `deep`.
 - `/model` shows the last auto-route decision so operators can see which route was picked and why.
 - Auto-routed sessions temporarily degrade a route after quota or rate-limit failures and skip it until the cooldown expires.
+- Route metadata only nudges scoring. Ambiguous prompts still stay on `balanced`; `fast` is reserved for high-confidence cheap tasks, and strong deep-analysis signals still win over cheaper routes.
 
 ### `channels`
 
