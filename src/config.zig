@@ -1,5 +1,6 @@
 const std = @import("std");
 const platform = @import("platform.zig");
+const provider_names = @import("provider_names.zig");
 pub const config_types = @import("config_types.zig");
 pub const config_parse = @import("config_parse.zig");
 /// Write a JSON-escaped string (with enclosing quotes) to any writer.
@@ -165,7 +166,7 @@ pub const Config = struct {
     /// Look up a provider's API key from the providers list.
     pub fn getProviderKey(self: *const Config, name: []const u8) ?[]const u8 {
         for (self.providers) |e| {
-            if (std.mem.eql(u8, e.name, name)) return e.api_key;
+            if (provider_names.providerNamesMatch(e.name, name)) return e.api_key;
         }
         return null;
     }
@@ -178,7 +179,7 @@ pub const Config = struct {
     /// Look up a provider's base_url from the providers list.
     pub fn getProviderBaseUrl(self: *const Config, name: []const u8) ?[]const u8 {
         for (self.providers) |e| {
-            if (std.mem.eql(u8, e.name, name)) return e.base_url;
+            if (provider_names.providerNamesMatch(e.name, name)) return e.base_url;
         }
         return null;
     }
@@ -187,7 +188,7 @@ pub const Config = struct {
     /// Returns true (default) if provider is not in the list.
     pub fn getProviderNativeTools(self: *const Config, name: []const u8) bool {
         for (self.providers) |e| {
-            if (std.mem.eql(u8, e.name, name)) return e.native_tools;
+            if (provider_names.providerNamesMatch(e.name, name)) return e.native_tools;
         }
         return true;
     }
@@ -196,7 +197,7 @@ pub const Config = struct {
     /// Returns null if provider is not in the list or has no user_agent set.
     pub fn getProviderUserAgent(self: *const Config, name: []const u8) ?[]const u8 {
         for (self.providers) |e| {
-            if (std.mem.eql(u8, e.name, name)) return e.user_agent;
+            if (provider_names.providerNamesMatch(e.name, name)) return e.user_agent;
         }
         return null;
     }
@@ -736,6 +737,8 @@ pub const Config = struct {
             .compaction_max_source_chars = self.agent.compaction_max_source_chars,
             .status_show_emojis = self.agent.status_show_emojis,
             .message_timeout_secs = self.agent.message_timeout_secs,
+            .vision_disabled_models = self.agent.vision_disabled_models,
+            .auto_disable_vision_on_error = self.agent.auto_disable_vision_on_error,
         }, .{})});
 
         // Channels
@@ -2335,9 +2338,11 @@ test "json parse scheduler section" {
 }
 
 test "json parse agent section" {
-    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     const json =
-        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000, "status_show_emojis": false}}
+        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000, "status_show_emojis": false, "vision_disabled_models": ["router/text-only"], "auto_disable_vision_on_error": false}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -2349,7 +2354,9 @@ test "json parse agent section" {
     try std.testing.expectEqual(@as(u64, 64_000), cfg.agent.token_limit);
     try std.testing.expect(cfg.agent.token_limit_explicit);
     try std.testing.expect(!cfg.agent.status_show_emojis);
-    allocator.free(cfg.agent.tool_dispatcher);
+    try std.testing.expectEqual(@as(usize, 1), cfg.agent.vision_disabled_models.len);
+    try std.testing.expectEqualStrings("router/text-only", cfg.agent.vision_disabled_models[0]);
+    try std.testing.expect(!cfg.agent.auto_disable_vision_on_error);
 }
 
 test "json parse agent token_limit explicit remains false when omitted" {
@@ -2794,6 +2801,8 @@ test "save and load roundtrip" {
     cfg.default_provider = try allocator.dupe(u8, "glm");
     cfg.default_model = try allocator.dupe(u8, "glm-4.7");
     cfg.workspace_dir_override = try allocator.dupe(u8, "C:\\Users\\menger\\Desktop\\myspace");
+    cfg.agent.vision_disabled_models = &.{ "router/text-only", "router/backup-text" };
+    cfg.agent.auto_disable_vision_on_error = false;
 
     try cfg.save();
 
@@ -2812,6 +2821,9 @@ test "save and load roundtrip" {
     try std.testing.expectEqualStrings("glm", cfg2.default_provider);
     try std.testing.expectEqualStrings("glm-4.7", cfg2.default_model.?);
     try std.testing.expect(cfg2.workspace_dir_override != null);
+    try std.testing.expectEqual(@as(usize, 2), cfg2.agent.vision_disabled_models.len);
+    try std.testing.expectEqualStrings("router/text-only", cfg2.agent.vision_disabled_models[0]);
+    try std.testing.expect(!cfg2.agent.auto_disable_vision_on_error);
 }
 
 test "parse agents.list with model object" {
@@ -3183,6 +3195,29 @@ test "getProviderKey returns null for missing provider" {
     };
     try std.testing.expect(cfg.getProviderKey("nonexistent") == null);
     try std.testing.expect(cfg.defaultProviderKey() == null);
+}
+
+test "provider config lookups match canonical aliases" {
+    const entries = [_]ProviderEntry{
+        .{
+            .name = "azure",
+            .api_key = "azure-test",
+            .base_url = "https://resource.openai.azure.com/openai/v1",
+            .native_tools = false,
+            .user_agent = "nullclaw-test/1.0",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .providers = &entries,
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expectEqualStrings("azure-test", cfg.getProviderKey("azure-openai").?);
+    try std.testing.expectEqualStrings("https://resource.openai.azure.com/openai/v1", cfg.getProviderBaseUrl("azure_openai").?);
+    try std.testing.expect(!cfg.getProviderNativeTools("azure-openai"));
+    try std.testing.expectEqualStrings("nullclaw-test/1.0", cfg.getProviderUserAgent("azure_openai").?);
 }
 
 test "providers defaults to empty" {
