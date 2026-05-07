@@ -503,6 +503,10 @@ pub const Agent = struct {
 
         // Build tool specs for function-calling APIs
         const specs = try allocator.alloc(ToolSpec, tools.len);
+        // Function-scope errdefer: covers any subsequent fallible op
+        // (resolveAgentWorkspacePath, redactor allocation, etc.). Without
+        // this, init-time OOM after `specs` is allocated would leak the slice.
+        errdefer allocator.free(specs);
         for (tools, 0..) |t, i| {
             specs[i] = .{
                 .name = t.name(),
@@ -513,11 +517,15 @@ pub const Agent = struct {
 
         var effective_workspace_dir = cfg.workspace_dir;
         var workspace_dir_owned = false;
+        // Function-scope errdefer: must outlive the nested `if (workspace_path)`
+        // block so that errors raised AFTER the block (e.g. allocator.create
+        // for the redactor) still trigger workspace_dir cleanup. The previous
+        // form lived inside the inner `if` and was deregistered at block exit.
+        errdefer if (workspace_dir_owned) allocator.free(effective_workspace_dir);
         if (profile) |agent_profile| {
             if (agent_profile.workspace_path) |workspace_path| {
                 effective_workspace_dir = try cfg.resolveAgentWorkspacePath(allocator, workspace_path);
                 workspace_dir_owned = true;
-                errdefer if (workspace_dir_owned) allocator.free(effective_workspace_dir);
                 Config.scaffoldAgentWorkspace(allocator, effective_workspace_dir) catch {};
             }
         }
