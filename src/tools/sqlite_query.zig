@@ -1,0 +1,707 @@
+//! Read-only SQLite analytics tool (DG-3).
+//!
+//! Three layers of defense against accidental writes:
+//!   1. Statement classifier — Zig-side allowlist for SELECT / WITH / PRAGMA table_info
+//!   2. SQLITE_OPEN_READONLY — engine cannot perform writes physically
+//!   3. sqlite3_stmt_readonly() — backstop check after prepare
+//!
+//! Output is bounded by row count and total bytes.
+
+const std = @import("std");
+const std_compat = @import("compat");
+const fs_compat = @import("../fs_compat.zig");
+const root = @import("root.zig");
+const path_security = @import("path_security.zig");
+const Tool = root.Tool;
+const ToolResult = root.ToolResult;
+const JsonObjectMap = root.JsonObjectMap;
+
+pub const c = @cImport({
+    @cInclude("sqlite3.h");
+});
+
+const SQLITE_STATIC: c.sqlite3_destructor_type = null;
+const BUSY_TIMEOUT_MS: c_int = 1000;
+const DEFAULT_MAX_RESULT_BYTES: usize = 256 * 1024;
+const DEFAULT_MAX_RESULT_ROWS: u32 = 1000;
+
+pub const SqliteQueryTool = struct {
+    workspace_dir: []const u8,
+    allowed_paths: []const []const u8 = &.{},
+    max_result_bytes: usize = DEFAULT_MAX_RESULT_BYTES,
+    max_result_rows: u32 = DEFAULT_MAX_RESULT_ROWS,
+
+    pub const tool_name = "sqlite_query";
+    pub const tool_description =
+        "Run a read-only SQL query against a SQLite database in the workspace. " ++
+        "Only SELECT, WITH, and PRAGMA table_info statements are permitted. " ++
+        "Returns a JSON object {columns, rows, row_count, truncated}. " ++
+        "Bounded by max_rows and an internal byte cap. Multi-statement input is rejected.";
+    pub const tool_params =
+        \\{"type":"object","properties":{"db_path":{"type":"string","description":"Workspace-relative path to the .db file."},"query":{"type":"string","description":"Single SELECT/WITH/PRAGMA table_info statement (no semicolons mid-stream)."},"max_rows":{"type":"integer","description":"Optional row cap (1..1000). Default: 1000."}},"required":["db_path","query"]}
+    ;
+
+    pub const vtable = root.ToolVTable(@This());
+
+    pub fn tool(self: *SqliteQueryTool) Tool {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    pub fn execute(self: *SqliteQueryTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        const db_path_arg = root.getString(args, "db_path") orelse {
+            return failOwned(allocator, "missing required parameter: db_path");
+        };
+        const query = root.getString(args, "query") orelse {
+            return failOwned(allocator, "missing required parameter: query");
+        };
+        const max_rows: u32 = blk: {
+            if (root.getInt(args, "max_rows")) |v| {
+                if (v <= 0) break :blk self.max_result_rows;
+                const clamped = @min(v, @as(i64, @intCast(self.max_result_rows)));
+                break :blk @intCast(clamped);
+            }
+            break :blk self.max_result_rows;
+        };
+
+        // Layer 1a: path safety (rejects absolute, traversal, null bytes)
+        if (!path_security.isPathSafe(db_path_arg)) {
+            return failOwned(allocator, "db_path failed safety check (must be relative, no traversal, no null bytes)");
+        }
+
+        // Layer 1b: resolve absolute path; ensure it is inside workspace or allowed_paths
+        const joined = try std.fs.path.join(allocator, &.{ self.workspace_dir, db_path_arg });
+        defer allocator.free(joined);
+
+        const resolved = fs_compat.realpathAllocPath(allocator, joined) catch |err| {
+            return failOwnedFmt(allocator, "could not resolve db_path: {s}", .{@errorName(err)});
+        };
+        defer allocator.free(resolved);
+
+        const ws_resolved = fs_compat.realpathAllocPath(allocator, self.workspace_dir) catch |err| {
+            return failOwnedFmt(allocator, "could not resolve workspace_dir: {s}", .{@errorName(err)});
+        };
+        defer allocator.free(ws_resolved);
+
+        if (!path_security.isResolvedPathAllowed(allocator, resolved, ws_resolved, self.allowed_paths)) {
+            return failOwned(allocator, "db_path is outside workspace and allowed_paths");
+        }
+
+        // Layer 1c: statement classifier (allowlist)
+        if (classifyStatement(query)) |err_msg| {
+            return failOwned(allocator, err_msg);
+        }
+
+        // Layer 2: open DB read-only — engine refuses any write attempt
+        var db: ?*c.sqlite3 = null;
+        const path_z = try allocator.dupeZ(u8, resolved);
+        defer allocator.free(path_z);
+        const open_rc = c.sqlite3_open_v2(path_z.ptr, &db, c.SQLITE_OPEN_READONLY, null);
+        if (open_rc != c.SQLITE_OK) {
+            const err_msg_raw = if (db) |d| std.mem.span(c.sqlite3_errmsg(d)) else "open failed";
+            const out_msg = try std.fmt.allocPrint(allocator, "open failed: {s}", .{err_msg_raw});
+            if (db) |d| _ = c.sqlite3_close(d);
+            return ToolResult{ .success = false, .output = out_msg };
+        }
+        defer _ = c.sqlite3_close(db);
+        _ = c.sqlite3_busy_timeout(db, BUSY_TIMEOUT_MS);
+
+        // Prepare statement
+        const query_z = try allocator.dupeZ(u8, query);
+        defer allocator.free(query_z);
+        var stmt: ?*c.sqlite3_stmt = null;
+        const prep_rc = c.sqlite3_prepare_v2(db, query_z.ptr, -1, &stmt, null);
+        if (prep_rc != c.SQLITE_OK) {
+            const err_msg = std.mem.span(c.sqlite3_errmsg(db));
+            const out_msg = try std.fmt.allocPrint(allocator, "prepare failed: {s}", .{err_msg});
+            return ToolResult{ .success = false, .output = out_msg };
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+
+        // Layer 3: backstop sqlite3_stmt_readonly check
+        if (c.sqlite3_stmt_readonly(stmt) == 0) {
+            return failOwned(allocator, "statement is not read-only (sqlite3_stmt_readonly check)");
+        }
+
+        return try renderRows(allocator, stmt.?, max_rows, self.max_result_bytes);
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// Statement classifier
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Returns null if the statement passes the allowlist, otherwise a static
+/// reason. The classifier is conservative — it never tries to fully parse
+/// SQL, only check the leading keyword + reject mid-stream semicolons.
+fn classifyStatement(query: []const u8) ?[]const u8 {
+    const trimmed = stripCommentsAndWhitespace(query);
+    if (trimmed.len == 0) return "empty query";
+
+    // Multi-statement guard: a semicolon followed by anything but whitespace
+    // and comments is a second statement and is rejected.
+    {
+        var i: usize = 0;
+        while (i < trimmed.len) : (i += 1) {
+            if (trimmed[i] == ';') {
+                const rest = stripCommentsAndWhitespace(trimmed[i + 1 ..]);
+                if (rest.len != 0) return "multi-statement queries are not allowed";
+            }
+        }
+    }
+
+    const first = firstKeyword(trimmed) orelse return "could not parse first keyword";
+    if (eqIgnoreCase(first, "SELECT")) return null;
+    if (eqIgnoreCase(first, "WITH")) {
+        // CTE — accept; sqlite3_stmt_readonly will catch any write inside it
+        return null;
+    }
+    if (eqIgnoreCase(first, "PRAGMA")) {
+        const after_pragma = std.mem.trimStart(u8, trimmed[first.len..], " \t\r\n");
+        const second = firstKeyword(after_pragma) orelse return "only PRAGMA table_info is allowed";
+        if (!eqIgnoreCase(second, "table_info")) return "only PRAGMA table_info is allowed";
+        return null;
+    }
+    return "only SELECT, WITH, or PRAGMA table_info statements are allowed";
+}
+
+fn stripCommentsAndWhitespace(s: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < s.len) {
+        const ch = s[i];
+        if (ch == ' ' or ch == '\t' or ch == '\r' or ch == '\n') {
+            i += 1;
+            continue;
+        }
+        if (i + 1 < s.len and ch == '-' and s[i + 1] == '-') {
+            // -- line comment until newline
+            while (i < s.len and s[i] != '\n') i += 1;
+            continue;
+        }
+        if (i + 1 < s.len and ch == '/' and s[i + 1] == '*') {
+            // /* block comment */
+            i += 2;
+            while (i + 1 < s.len and !(s[i] == '*' and s[i + 1] == '/')) i += 1;
+            if (i + 1 < s.len) i += 2;
+            continue;
+        }
+        return s[i..];
+    }
+    return s[s.len..];
+}
+
+fn firstKeyword(s: []const u8) ?[]const u8 {
+    var end: usize = 0;
+    while (end < s.len) : (end += 1) {
+        const ch = s[end];
+        if (!std.ascii.isAlphabetic(ch) and ch != '_') break;
+    }
+    if (end == 0) return null;
+    return s[0..end];
+}
+
+fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
+    }
+    return true;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Row rendering
+// ════════════════════════════════════════════════════════════════════════════
+
+fn renderRows(allocator: std.mem.Allocator, stmt: *c.sqlite3_stmt, max_rows: u32, max_bytes: usize) !ToolResult {
+    const col_count: usize = @intCast(c.sqlite3_column_count(stmt));
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "{\"columns\":[");
+    var ci: usize = 0;
+    while (ci < col_count) : (ci += 1) {
+        if (ci > 0) try out.append(allocator, ',');
+        const name_raw = c.sqlite3_column_name(stmt, @intCast(ci));
+        const name = if (name_raw == null) "" else std.mem.span(name_raw);
+        try appendJsonString(allocator, &out, name);
+    }
+    try out.appendSlice(allocator, "],\"rows\":[");
+
+    var row_count: u32 = 0;
+    var truncated = false;
+
+    while (true) {
+        const rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_DONE) break;
+        if (rc != c.SQLITE_ROW) {
+            const err_msg = std.mem.span(c.sqlite3_errmsg(c.sqlite3_db_handle(stmt)));
+            const out_msg = try std.fmt.allocPrint(allocator, "step failed: {s}", .{err_msg});
+            out.deinit(allocator);
+            return ToolResult{ .success = false, .output = out_msg };
+        }
+
+        if (row_count >= max_rows) {
+            truncated = true;
+            break;
+        }
+        if (out.items.len >= max_bytes) {
+            truncated = true;
+            break;
+        }
+
+        if (row_count > 0) try out.append(allocator, ',');
+        try out.append(allocator, '[');
+        var col: c_int = 0;
+        while (col < @as(c_int, @intCast(col_count))) : (col += 1) {
+            if (col > 0) try out.append(allocator, ',');
+            try appendCellAsJson(allocator, &out, stmt, col);
+        }
+        try out.append(allocator, ']');
+        row_count += 1;
+    }
+
+    try out.appendSlice(allocator, "],\"row_count\":");
+    var num_buf: [32]u8 = undefined;
+    const rc_str = try std.fmt.bufPrint(&num_buf, "{d}", .{row_count});
+    try out.appendSlice(allocator, rc_str);
+    try out.appendSlice(allocator, ",\"truncated\":");
+    try out.appendSlice(allocator, if (truncated) "true" else "false");
+    try out.append(allocator, '}');
+
+    return ToolResult{ .success = true, .output = try out.toOwnedSlice(allocator) };
+}
+
+fn appendCellAsJson(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    stmt: *c.sqlite3_stmt,
+    col: c_int,
+) !void {
+    const col_type = c.sqlite3_column_type(stmt, col);
+    switch (col_type) {
+        c.SQLITE_NULL => try out.appendSlice(allocator, "null"),
+        c.SQLITE_INTEGER => {
+            const v = c.sqlite3_column_int64(stmt, col);
+            var buf: [32]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "{d}", .{v});
+            try out.appendSlice(allocator, s);
+        },
+        c.SQLITE_FLOAT => {
+            const v = c.sqlite3_column_double(stmt, col);
+            var buf: [64]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "{d}", .{v});
+            try out.appendSlice(allocator, s);
+        },
+        c.SQLITE_TEXT => {
+            const raw = c.sqlite3_column_text(stmt, col);
+            const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+            const slice = if (raw == null) ""[0..] else @as([*]const u8, @ptrCast(raw))[0..len];
+            try appendJsonString(allocator, out, slice);
+        },
+        c.SQLITE_BLOB => {
+            const len: usize = @intCast(c.sqlite3_column_bytes(stmt, col));
+            try out.appendSlice(allocator, "\"<blob:");
+            var buf: [32]u8 = undefined;
+            const s = try std.fmt.bufPrint(&buf, "{d}", .{len});
+            try out.appendSlice(allocator, s);
+            try out.appendSlice(allocator, ">\"");
+        },
+        else => try out.appendSlice(allocator, "null"),
+    }
+}
+
+fn appendJsonString(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    s: []const u8,
+) !void {
+    try out.append(allocator, '"');
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => {
+                if (ch < 0x20) {
+                    var buf: [8]u8 = undefined;
+                    const formatted = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{ch});
+                    try out.appendSlice(allocator, formatted);
+                } else {
+                    try out.append(allocator, ch);
+                }
+            },
+        }
+    }
+    try out.append(allocator, '"');
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Error helpers
+// ════════════════════════════════════════════════════════════════════════════
+
+fn failOwned(allocator: std.mem.Allocator, msg: []const u8) !ToolResult {
+    return ToolResult{ .success = false, .output = try allocator.dupe(u8, msg) };
+}
+
+fn failOwnedFmt(
+    allocator: std.mem.Allocator,
+    comptime fmt: []const u8,
+    args: anytype,
+) !ToolResult {
+    return ToolResult{ .success = false, .output = try std.fmt.allocPrint(allocator, fmt, args) };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+const TestDb = struct {
+    fn populate(path: [*:0]const u8) !void {
+        var db: ?*c.sqlite3 = null;
+        const rc = c.sqlite3_open(path, &db);
+        if (rc != c.SQLITE_OK) {
+            if (db) |d| _ = c.sqlite3_close(d);
+            return error.OpenFailed;
+        }
+        defer _ = c.sqlite3_close(db);
+        const sql =
+            "CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, score REAL, picture BLOB);" ++
+            "INSERT INTO u (id, name, age, score, picture) VALUES (1, 'alice', 30, 9.5, X'00FF00');" ++
+            "INSERT INTO u (id, name, age, score) VALUES (2, 'bob', 25, 7.25);" ++
+            "INSERT INTO u (id, name, age) VALUES (3, NULL, 40);";
+        if (c.sqlite3_exec(db, sql, null, null, null) != c.SQLITE_OK) return error.PopulateFailed;
+    }
+
+    fn populateMany(path: [*:0]const u8, n: usize) !void {
+        var db: ?*c.sqlite3 = null;
+        const rc = c.sqlite3_open(path, &db);
+        if (rc != c.SQLITE_OK) {
+            if (db) |d| _ = c.sqlite3_close(d);
+            return error.OpenFailed;
+        }
+        defer _ = c.sqlite3_close(db);
+        if (c.sqlite3_exec(db, "CREATE TABLE big (id INTEGER, payload TEXT);", null, null, null) != c.SQLITE_OK) {
+            return error.PopulateFailed;
+        }
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var buf: [128]u8 = undefined;
+            const sql = try std.fmt.bufPrintZ(&buf, "INSERT INTO big VALUES ({d}, 'row{d}');", .{ i, i });
+            if (c.sqlite3_exec(db, sql.ptr, null, null, null) != c.SQLITE_OK) return error.PopulateFailed;
+        }
+    }
+};
+
+fn setupToolWithDb(comptime db_name: []const u8) !struct {
+    tool: SqliteQueryTool,
+    tmp: std.testing.TmpDir,
+    ws_path: []const u8,
+    db_path: [:0]const u8,
+} {
+    var tmp = std.testing.tmpDir(.{});
+    errdefer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    errdefer std.testing.allocator.free(ws_path);
+    const db_path_buf = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/{s}", .{ ws_path, db_name }, 0);
+    return .{
+        .tool = .{ .workspace_dir = ws_path },
+        .tmp = tmp,
+        .ws_path = ws_path,
+        .db_path = db_path_buf,
+    };
+}
+
+test "sqlite_query: SELECT returns columns and rows as JSON" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"test.db\",\"query\":\"SELECT id, name FROM u WHERE id = 1\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"columns\":[\"id\",\"name\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "[1,\"alice\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"row_count\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"truncated\":false") != null);
+}
+
+test "sqlite_query: WITH (CTE) allowed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs(
+        \\{"db_path":"test.db","query":"WITH adults AS (SELECT * FROM u WHERE age >= 30) SELECT count(*) FROM adults"}
+    );
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "[2]") != null);
+}
+
+test "sqlite_query: PRAGMA table_info allowed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"test.db\",\"query\":\"PRAGMA table_info(u)\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"name\"") != null);
+}
+
+test "sqlite_query: PRAGMA other than table_info rejected" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"test.db\",\"query\":\"PRAGMA foreign_keys = ON\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "PRAGMA table_info") != null);
+}
+
+test "sqlite_query: rejects INSERT" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"test.db\",\"query\":\"INSERT INTO u (name) VALUES ('mallory')\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "sqlite_query: rejects UPDATE" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"test.db\",\"query\":\"UPDATE u SET name='evil' WHERE id=1\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "sqlite_query: rejects DROP" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"test.db\",\"query\":\"DROP TABLE u\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "sqlite_query: rejects multi-statement (semicolon)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"test.db\",\"query\":\"SELECT 1; DROP TABLE u\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "multi-statement") != null);
+}
+
+test "sqlite_query: rejects ATTACH" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"test.db\",\"query\":\"ATTACH DATABASE 'other.db' AS other\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "sqlite_query: respects max_rows cap (truncated=true)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/big.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populateMany(db_path_z.ptr, 50);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"big.db\",\"query\":\"SELECT id FROM big\",\"max_rows\":5}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"row_count\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"truncated\":true") != null);
+}
+
+test "sqlite_query: invalid db_path (traversal) rejected" {
+    const allocator = std.testing.allocator;
+    var sqt = SqliteQueryTool{ .workspace_dir = "/tmp/yc_test_dg3_traversal" };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"../etc/passwd\",\"query\":\"SELECT 1\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "safety check") != null);
+}
+
+test "sqlite_query: invalid db_path (absolute) rejected" {
+    const allocator = std.testing.allocator;
+    var sqt = SqliteQueryTool{ .workspace_dir = "/tmp/yc_test_dg3_abs" };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"/etc/passwd\",\"query\":\"SELECT 1\"}");
+    defer parsed.deinit();
+    const result = try t.execute(allocator, parsed.value.object);
+    defer allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "safety check") != null);
+}
+
+test "sqlite_query: NULL column values render as JSON null" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"test.db\",\"query\":\"SELECT name FROM u WHERE id = 3\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "[null]") != null);
+}
+
+test "sqlite_query: column name 'update_count' allowed (no false positive on UPDATE)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/aliased.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    {
+        var db: ?*c.sqlite3 = null;
+        _ = c.sqlite3_open(db_path_z.ptr, &db);
+        defer _ = c.sqlite3_close(db);
+        _ = c.sqlite3_exec(db, "CREATE TABLE m (update_count INTEGER); INSERT INTO m VALUES (42);", null, null, null);
+    }
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs(
+        \\{"db_path":"aliased.db","query":"SELECT update_count FROM m"}
+    );
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "[42]") != null);
+}
+
+test "sqlite_query: tool metadata sanity" {
+    var sqt = SqliteQueryTool{ .workspace_dir = "/tmp" };
+    const t = sqt.tool();
+    try std.testing.expectEqualStrings("sqlite_query", t.name());
+    try std.testing.expect(t.description().len > 0);
+    try std.testing.expect(t.parametersJson().len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, t.parametersJson(), "db_path") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t.parametersJson(), "query") != null);
+}
+
+test "classifyStatement: rejects empty" {
+    try std.testing.expect(classifyStatement("") != null);
+    try std.testing.expect(classifyStatement("   \t\n") != null);
+}
+
+test "classifyStatement: accepts SELECT" {
+    try std.testing.expect(classifyStatement("SELECT 1") == null);
+    try std.testing.expect(classifyStatement("  -- comment\nSELECT 1") == null);
+    try std.testing.expect(classifyStatement("/* foo */ select * from t") == null);
+}
+
+test "classifyStatement: rejects keyword-prefixed garbage" {
+    try std.testing.expect(classifyStatement("DROP TABLE x") != null);
+    try std.testing.expect(classifyStatement("VACUUM") != null);
+    try std.testing.expect(classifyStatement("CREATE TABLE x(a INT)") != null);
+    try std.testing.expect(classifyStatement("BEGIN TRANSACTION") != null);
+}
