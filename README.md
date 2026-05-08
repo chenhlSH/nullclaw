@@ -771,6 +771,7 @@ See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including 
 | `onboard --interactive` | Full interactive wizard |
 | `onboard --channels-only` | Reconfigure channels/allowlists only |
 | `agent -m "..."` | Single message mode |
+| `acp` | Start the Agent Client Protocol stdio adapter for ACP-compatible editors |
 | `agent` | Interactive chat mode |
 | `gateway` | Start long-running runtime (default: `127.0.0.1:3000`) |
 | `service install\|start\|stop\|restart\|status\|uninstall` | Manage background service |
