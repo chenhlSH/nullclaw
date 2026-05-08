@@ -2,8 +2,11 @@
 
 ## Debian
 
-以下步骤用于在全新的 Debian 系统上从官方 tar 包安装 Zig 0.16.0。
+以下步骤用于在全新的 Debian 系统上从官方 x86_64 Linux tar 包安装 Zig 0.16.0。
 请以 root 身份执行 `apt` 命令；如果使用普通用户，请在每条命令前加上 `sudo`。
+
+仓库里的 CI 和容器构建通过 `.github/scripts/install-zig.sh` 解析 Zig 下载信息。
+本页保留手动 Debian 安装路径，方便用户在第一次源码构建前先装好 Zig。
 
 1. 刷新软件包索引：
 
@@ -14,12 +17,11 @@
 2. 安装下载与解压所需的工具：
 
    ```bash
-   apt install -y wget xz-utils
+   apt install -y ca-certificates wget xz-utils
    ```
 
-3. 访问 [ziglang.org/download](https://ziglang.org/download/) 并复制你需要的 Zig
-   版本对应的下载链接。在常见的 Debian x86_64 机器上，使用 Linux `x86_64`
-   变体：
+3. 访问 [ziglang.org/download](https://ziglang.org/download/) 并复制 Zig 0.16.0
+   对应的下载链接。在常见的 Debian x86_64 机器上，使用 Linux `x86_64` 变体：
 
    [https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz](https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz)
 
@@ -29,14 +31,33 @@
    wget https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
    ```
 
-5. 解压：
+5. 使用官方下载元数据里的校验和验证压缩包：
+
+   ```bash
+   printf '%s  %s\n' \
+     70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00 \
+     zig-x86_64-linux-0.16.0.tar.xz | sha256sum -c -
+   ```
+
+6. 解压：
 
    ```bash
    tar -xf zig-x86_64-linux-0.16.0.tar.xz
    ```
 
-6. 把解压后的目录加入 `PATH`：
+7. 把解压后的目录加入 `PATH`：
 
    ```bash
    export PATH="$PWD/zig-x86_64-linux-0.16.0:$PATH"
    ```
+
+   如果希望新 shell 也能直接使用 Zig，请把同一条 `export` 命令写入你的 shell
+   profile，并使用解压目录的绝对路径。
+
+8. 验证精确版本：
+
+   ```bash
+   zig version
+   ```
+
+   输出必须是 `0.16.0`。

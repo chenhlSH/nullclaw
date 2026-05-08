@@ -228,13 +228,14 @@ Required steps:
    the filename, archive layout, and presence of the build are confirmed.
 3. For every architecture referenced in the install guides (at minimum
    `x86_64-linux`, plus any others already documented), copy the canonical
-   tarball URL from `ziglang.org/download/`.
+   tarball URL and checksum from `ziglang.org/download/`.
 4. Update every `docs/**/zig-installation.md` file (currently
    `docs/en/zig-installation.md` and `docs/zh/zig-installation.md`) so that
-   every URL, filename, and extracted directory name reflects the new
+   every URL, checksum, filename, and extracted directory name reflects the new
    version. The version number must appear consistently in:
    - the linked download URL
    - the `wget` command
+   - the checksum verification command
    - the `tar -xf` filename
    - the `export PATH="$PWD/zig-...:$PATH"` directory name
 5. Keep all `docs/**/zig-installation.md` translations in sync — if the
