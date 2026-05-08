@@ -518,9 +518,7 @@ pub const Agent = struct {
 
         // Build tool specs for function-calling APIs
         const specs = try allocator.alloc(ToolSpec, tools.len);
-        // Function-scope errdefer: covers any subsequent fallible op
-        // (resolveAgentWorkspacePath, redactor allocation, etc.). Without
-        // this, init-time OOM after `specs` is allocated would leak the slice.
+        // Ownership transfers to Agent only after all initialization succeeds.
         errdefer allocator.free(specs);
         for (tools, 0..) |t, i| {
             specs[i] = .{
@@ -532,10 +530,7 @@ pub const Agent = struct {
 
         var effective_workspace_dir = cfg.workspace_dir;
         var workspace_dir_owned = false;
-        // Function-scope errdefer: must outlive the nested `if (workspace_path)`
-        // block so that errors raised AFTER the block (e.g. allocator.create
-        // for the redactor) still trigger workspace_dir cleanup. The previous
-        // form lived inside the inner `if` and was deregistered at block exit.
+        // Free a resolved workspace override on any later initialization error.
         errdefer if (workspace_dir_owned) allocator.free(effective_workspace_dir);
         if (profile) |agent_profile| {
             if (agent_profile.workspace_path) |workspace_path| {
@@ -561,13 +556,10 @@ pub const Agent = struct {
             const enabled = if (profile) |p| p.enable_pii_redaction else cfg.agent.enable_pii_redaction;
             if (!enabled) break :blk null;
             const r = try allocator.create(redaction.Redactor);
-            // Inner errdefer covers any future fallible op between alloc and break.
             errdefer allocator.destroy(r);
             r.* = redaction.Redactor.init(allocator, .{});
             break :blk r;
         };
-        // Outer errdefer fires if any future fallible op is added between this
-        // block and the return statement.
         errdefer if (redactor_ptr) |r| {
             r.deinit();
             allocator.destroy(r);
@@ -10502,13 +10494,13 @@ const RedactCaptureProvider = struct {
     }
 
     fn getName(_: *anyopaque) []const u8 {
-        return "dg2-redact-capture";
+        return "redact-capture";
     }
 
     fn deinitFn(_: *anyopaque) void {}
 };
 
-const dg2_capture_vtable = Provider.VTable{
+const redact_capture_vtable = Provider.VTable{
     .chatWithSystem = RedactCaptureProvider.chatWithSystem,
     .chat = RedactCaptureProvider.chat,
     .supportsNativeTools = RedactCaptureProvider.supportsNativeTools,
@@ -10516,7 +10508,7 @@ const dg2_capture_vtable = Provider.VTable{
     .deinit = RedactCaptureProvider.deinitFn,
 };
 
-fn dg2BaseConfig(allocator: std.mem.Allocator) Config {
+fn redactionBaseConfig(allocator: std.mem.Allocator) Config {
     return Config{
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
@@ -10526,11 +10518,11 @@ fn dg2BaseConfig(allocator: std.mem.Allocator) Config {
     };
 }
 
-fn dg2FromConfigAllocationTest(allocator: std.mem.Allocator) !void {
+fn redactionFromConfigAllocationTest(allocator: std.mem.Allocator) !void {
     var state = RedactCaptureProvider{ .capture_alloc = std.testing.allocator };
-    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &redact_capture_vtable };
 
-    var cfg = dg2BaseConfig(allocator);
+    var cfg = redactionBaseConfig(allocator);
     cfg.memory.backend = "none";
 
     var noop = observability.NoopObserver{};
@@ -10541,16 +10533,16 @@ fn dg2FromConfigAllocationTest(allocator: std.mem.Allocator) !void {
 test "Agent.fromConfigWithProfile handles allocation failures without leaks" {
     // Regression: init-time OOM after bootstrap provider creation must deinit
     // bootstrap/redactor/spec resources before returning error.OutOfMemory.
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, dg2FromConfigAllocationTest, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, redactionFromConfigAllocationTest, .{});
 }
 
 test "Agent: redactor enabled scrubs email before provider" {
     const allocator = std.testing.allocator;
     var state = RedactCaptureProvider{ .capture_alloc = allocator };
     defer if (state.captured_user) |c| allocator.free(c);
-    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &redact_capture_vtable };
 
-    var cfg = dg2BaseConfig(allocator);
+    var cfg = redactionBaseConfig(allocator);
     const profile = config_types.NamedAgentConfig{
         .name = "redact-on",
         .provider = "openrouter",
@@ -10578,9 +10570,9 @@ test "Agent: redactor stores redacted user content in local history" {
     const allocator = std.testing.allocator;
     var state = RedactCaptureProvider{ .capture_alloc = allocator };
     defer if (state.captured_user) |c| allocator.free(c);
-    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &redact_capture_vtable };
 
-    var cfg = dg2BaseConfig(allocator);
+    var cfg = redactionBaseConfig(allocator);
     var noop = observability.NoopObserver{};
     var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{}, null, noop.observer(), null);
     defer agent.deinit();
@@ -10601,13 +10593,13 @@ test "Agent: redactor stores redacted autosave memory" {
     const allocator = std.testing.allocator;
     var state = RedactCaptureProvider{ .capture_alloc = allocator };
     defer if (state.captured_user) |c| allocator.free(c);
-    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &redact_capture_vtable };
 
     var mem_backend = memory_mod.memory_lru.InMemoryLruMemory.init(allocator, 16);
     defer mem_backend.deinit();
     const mem = mem_backend.memory();
 
-    var cfg = dg2BaseConfig(allocator);
+    var cfg = redactionBaseConfig(allocator);
     cfg.memory.auto_save = true;
 
     var noop = observability.NoopObserver{};
@@ -10706,7 +10698,7 @@ test "Agent: redactor scrubs failed tool output in observer detail" {
     var tool_state = PiiFailureTool{};
     const tool = tool_state.tool();
 
-    var cfg = dg2BaseConfig(allocator);
+    var cfg = redactionBaseConfig(allocator);
     var observer = RecordingObserver{};
     var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{tool}, null, observer.observer(), null);
     defer agent.deinit();
@@ -10758,7 +10750,7 @@ test "Agent: redactor scrubs LLM response observer detail" {
     var provider_state: u8 = 0;
     const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
 
-    var cfg = dg2BaseConfig(allocator);
+    var cfg = redactionBaseConfig(allocator);
     cfg.diagnostics.log_llm_io = true;
 
     var observer = RecordingObserver{};
@@ -10778,9 +10770,9 @@ test "Agent: redactor disabled passes content through verbatim" {
     const allocator = std.testing.allocator;
     var state = RedactCaptureProvider{ .capture_alloc = allocator };
     defer if (state.captured_user) |c| allocator.free(c);
-    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &redact_capture_vtable };
 
-    var cfg = dg2BaseConfig(allocator);
+    var cfg = redactionBaseConfig(allocator);
     const profile = config_types.NamedAgentConfig{
         .name = "redact-off",
         .provider = "openrouter",
@@ -10808,9 +10800,9 @@ test "Agent: root redactor can be disabled from agent config" {
     const allocator = std.testing.allocator;
     var state = RedactCaptureProvider{ .capture_alloc = allocator };
     defer if (state.captured_user) |c| allocator.free(c);
-    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &redact_capture_vtable };
 
-    var cfg = dg2BaseConfig(allocator);
+    var cfg = redactionBaseConfig(allocator);
     cfg.agent.enable_pii_redaction = false;
 
     var noop = observability.NoopObserver{};
@@ -10832,9 +10824,9 @@ test "Agent: redactor preserves cross-turn placeholder ids" {
     const allocator = std.testing.allocator;
     var state = RedactCaptureProvider{ .capture_alloc = allocator };
     defer if (state.captured_user) |c| allocator.free(c);
-    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &redact_capture_vtable };
 
-    var cfg = dg2BaseConfig(allocator);
+    var cfg = redactionBaseConfig(allocator);
     const profile = config_types.NamedAgentConfig{
         .name = "redact-cross-turn",
         .provider = "openrouter",
@@ -10866,9 +10858,9 @@ test "Agent: clearHistory resets redactor placeholder state" {
     const allocator = std.testing.allocator;
     var state = RedactCaptureProvider{ .capture_alloc = allocator };
     defer if (state.captured_user) |c| allocator.free(c);
-    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &dg2_capture_vtable };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &redact_capture_vtable };
 
-    var cfg = dg2BaseConfig(allocator);
+    var cfg = redactionBaseConfig(allocator);
     const profile = config_types.NamedAgentConfig{
         .name = "redact-reset",
         .provider = "openrouter",
@@ -10936,9 +10928,8 @@ test "Agent.redactMessagesForProvider redacts multimodal text and image URLs" {
 // ---- iteration-exhausted summary path ----
 
 test "Agent: redactor scrubs PII in iteration-exhausted summary call" {
-    // Regression: round-1 review fixed a leak where the summary call (when
-    // agent hits max_tool_iterations) bypassed the redaction hook. This test
-    // forces the loop to exhaust and asserts the summary call sees redacted PII.
+    // Regression: iteration-limit summary calls use a separate provider path.
+    // Force the loop to exhaust and assert the summary prompt is redacted.
 
     const NoopIterTool = struct {
         const Self = @This();
@@ -11045,7 +11036,7 @@ test "Agent: redactor scrubs PII in iteration-exhausted summary call" {
         };
     }
     // `fromConfigWithProfile` doesn't take tools; we'll wire them on the agent struct.
-    var cfg = dg2BaseConfig(allocator);
+    var cfg = redactionBaseConfig(allocator);
     const profile = config_types.NamedAgentConfig{
         .name = "iter-exhausted",
         .provider = "openrouter",
@@ -11170,7 +11161,7 @@ test "Agent: redactor scrubs PII before provider.streamChat" {
         .vtable = &provider_vtable,
     };
 
-    var cfg = dg2BaseConfig(allocator);
+    var cfg = redactionBaseConfig(allocator);
     const profile = config_types.NamedAgentConfig{
         .name = "streaming-redact",
         .provider = "openrouter",
@@ -11263,7 +11254,7 @@ test "Agent: redactor scrubs PII in system prompt" {
         .vtable = &provider_vtable,
     };
 
-    var cfg = dg2BaseConfig(allocator);
+    var cfg = redactionBaseConfig(allocator);
     const profile = config_types.NamedAgentConfig{
         .name = "system-pii",
         .provider = "openrouter",

@@ -611,7 +611,7 @@ test "sqlite_query: respects max_rows cap (truncated=true)" {
 
 test "sqlite_query: invalid db_path (traversal) rejected" {
     const allocator = std.testing.allocator;
-    var sqt = SqliteQueryTool{ .workspace_dir = "/tmp/yc_test_dg3_traversal" };
+    var sqt = SqliteQueryTool{ .workspace_dir = "/tmp/yc_test_sqlite_query_traversal" };
     const t = sqt.tool();
     const parsed = try root.parseTestArgs("{\"db_path\":\"../etc/passwd\",\"query\":\"SELECT 1\"}");
     defer parsed.deinit();
@@ -623,7 +623,7 @@ test "sqlite_query: invalid db_path (traversal) rejected" {
 
 test "sqlite_query: invalid db_path (absolute) rejected" {
     const allocator = std.testing.allocator;
-    var sqt = SqliteQueryTool{ .workspace_dir = "/tmp/yc_test_dg3_abs" };
+    var sqt = SqliteQueryTool{ .workspace_dir = "/tmp/yc_test_sqlite_query_abs" };
     const t = sqt.tool();
     const parsed = try root.parseTestArgs("{\"db_path\":\"/etc/passwd\",\"query\":\"SELECT 1\"}");
     defer parsed.deinit();
