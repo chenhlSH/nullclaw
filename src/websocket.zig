@@ -1151,12 +1151,20 @@ test "ws readExact plain reads data then ConnectionClosed on EOF" {
 var test_connect_attempts: [4]std_compat.net.Address = undefined;
 var test_connect_attempts_len: usize = 0;
 
+fn fakeTestStreamHandle() std_compat.net.Stream.Handle {
+    return switch (@typeInfo(std_compat.net.Stream.Handle)) {
+        .int => @as(std_compat.net.Stream.Handle, 123),
+        .pointer => @ptrFromInt(@as(usize, 123)),
+        else => @compileError("unsupported socket handle type"),
+    };
+}
+
 fn fakeConnectSecondAddress(address: std_compat.net.Address) !std_compat.net.Stream {
     test_connect_attempts[test_connect_attempts_len] = address;
     test_connect_attempts_len += 1;
 
     if (test_connect_attempts_len == 1) return error.ConnectionRefused;
-    return .{ .handle = @as(std_compat.net.Stream.Handle, 123) };
+    return .{ .handle = fakeTestStreamHandle() };
 }
 
 fn fakeConnectAlwaysFails(address: std_compat.net.Address) !std_compat.net.Stream {
@@ -1176,7 +1184,7 @@ test "ws connect retries later resolved address after first connect failure" {
 
     const stream = try WsClient.connectToResolvedAddresses(fakeConnectSecondAddress, &addresses);
     try std.testing.expectEqual(@as(usize, 2), test_connect_attempts_len);
-    try std.testing.expectEqual(@as(std_compat.net.Stream.Handle, 123), stream.handle);
+    try std.testing.expectEqual(fakeTestStreamHandle(), stream.handle);
     try std.testing.expectEqual(addresses[0].in.sa.addr, test_connect_attempts[0].in.sa.addr);
     try std.testing.expectEqual(addresses[1].in.sa.addr, test_connect_attempts[1].in.sa.addr);
 }
