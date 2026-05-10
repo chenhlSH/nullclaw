@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const std_compat = @import("compat");
+const builtin = @import("builtin");
 
 const log = std.log.scoped(.websocket);
 
@@ -76,11 +77,11 @@ pub const WsClient = struct {
         path: []const u8,
         extra_headers: []const []const u8,
     ) !WsClient {
-        // DNS + TCP
+        // DNS + TCP. Some environments return multiple gateway IPs where the
+        // first one is not reachable, so try each resolved address in order.
         const addr_list = try std_compat.net.getAddressList(allocator, host, port);
         defer addr_list.deinit();
-        if (addr_list.addrs.len == 0) return error.DnsResolutionFailed;
-        const stream = try std_compat.net.tcpConnectToAddress(addr_list.addrs[0]);
+        const stream = try connectToResolvedAddresses(std_compat.net.tcpConnectToAddress, addr_list.addrs);
         errdefer stream.close();
 
         // Allocate TLS buffers (pattern from irc.zig)
@@ -163,8 +164,7 @@ pub const WsClient = struct {
     ) !WsClient {
         const addr_list = try std_compat.net.getAddressList(allocator, host, port);
         defer addr_list.deinit();
-        if (addr_list.addrs.len == 0) return error.DnsResolutionFailed;
-        const stream = try std_compat.net.tcpConnectToAddress(addr_list.addrs[0]);
+        const stream = try connectToResolvedAddresses(std_compat.net.tcpConnectToAddress, addr_list.addrs);
         errdefer stream.close();
 
         var client = WsClient{
@@ -177,6 +177,21 @@ pub const WsClient = struct {
 
         try client.performHandshake(host, path, extra_headers);
         return client;
+    }
+
+    fn connectToResolvedAddresses(comptime connectFn: anytype, addresses: []const std_compat.net.Address) !std_compat.net.Stream {
+        if (addresses.len == 0) return error.DnsResolutionFailed;
+
+        for (addresses) |addr| {
+            return connectFn(addr) catch |err| {
+                if (!builtin.is_test) {
+                    log.warn("WS connect failed for resolved address {}: {}", .{ addr, err });
+                }
+                continue;
+            };
+        }
+
+        return error.ConnectFailed;
     }
 
     fn performHandshake(
@@ -998,4 +1013,48 @@ test "ws readExact plain reads data then ConnectionClosed on EOF" {
     // Next read hits EOF
     var buf2: [1]u8 = undefined;
     try std.testing.expectError(error.ConnectionClosed, client.readExact(&buf2));
+}
+
+var test_connect_attempts: [4]std_compat.net.Address = undefined;
+var test_connect_attempts_len: usize = 0;
+
+fn fakeConnectSecondAddress(address: std_compat.net.Address) !std_compat.net.Stream {
+    test_connect_attempts[test_connect_attempts_len] = address;
+    test_connect_attempts_len += 1;
+
+    if (test_connect_attempts_len == 1) return error.ConnectionRefused;
+    return .{ .handle = @as(std_compat.net.Stream.Handle, 123) };
+}
+
+fn fakeConnectAlwaysFails(address: std_compat.net.Address) !std_compat.net.Stream {
+    test_connect_attempts[test_connect_attempts_len] = address;
+    test_connect_attempts_len += 1;
+    return error.ConnectionRefused;
+}
+
+// Regression: Discord gateway DNS on Android can yield an unreachable first
+// address; WsClient.connect must retry later resolved addresses.
+test "ws connect retries later resolved address after first connect failure" {
+    test_connect_attempts_len = 0;
+    const addresses = [_]std_compat.net.Address{
+        try std_compat.net.Address.parseIp4("192.0.2.1", 443),
+        try std_compat.net.Address.parseIp4("198.51.100.2", 443),
+    };
+
+    const stream = try WsClient.connectToResolvedAddresses(fakeConnectSecondAddress, &addresses);
+    try std.testing.expectEqual(@as(usize, 2), test_connect_attempts_len);
+    try std.testing.expectEqual(@as(std_compat.net.Stream.Handle, 123), stream.handle);
+    try std.testing.expectEqual(addresses[0].in.sa.addr, test_connect_attempts[0].in.sa.addr);
+    try std.testing.expectEqual(addresses[1].in.sa.addr, test_connect_attempts[1].in.sa.addr);
+}
+
+test "ws connect returns ConnectFailed when all resolved addresses fail" {
+    test_connect_attempts_len = 0;
+    const addresses = [_]std_compat.net.Address{
+        try std_compat.net.Address.parseIp4("192.0.2.1", 443),
+        try std_compat.net.Address.parseIp4("198.51.100.2", 443),
+    };
+
+    try std.testing.expectError(error.ConnectFailed, WsClient.connectToResolvedAddresses(fakeConnectAlwaysFails, &addresses));
+    try std.testing.expectEqual(@as(usize, 2), test_connect_attempts_len);
 }
