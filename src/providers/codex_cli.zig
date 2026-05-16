@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const root = @import("root.zig");
 
 const Provider = root.Provider;
@@ -139,13 +140,14 @@ pub const CodexCliProvider = struct {
 // Shared helpers
 // ════════════════════════════════════════════════════════════════════════════
 
-/// Check if a CLI tool is available in PATH using `which`.
+/// Check if a CLI tool is available in PATH using `which`/`where`.
 fn checkCliAvailable(allocator: std.mem.Allocator, cli_name: []const u8) !void {
-    const argv = [_][]const u8{ "which", cli_name };
+    const locator_cmd = if (builtin.os.tag == .windows) "where" else "which";
+    const argv = [_][]const u8{ locator_cmd, cli_name };
     var child = std.process.Child.init(&argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
-    try child.spawn();
+    child.spawn() catch return error.CliNotFound;
     const out = child.stdout.?.readToEndAlloc(allocator, 4096) catch {
         _ = child.wait() catch {};
         return error.CliNotFound;
@@ -166,7 +168,7 @@ fn checkCliVersion(allocator: std.mem.Allocator, cli_name: []const u8) !void {
     var child = std.process.Child.init(&argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
-    try child.spawn();
+    child.spawn() catch return error.CliNotFound;
     const out = child.stdout.?.readToEndAlloc(allocator, 4096) catch {
         _ = child.wait() catch {};
         return error.CliNotFound;

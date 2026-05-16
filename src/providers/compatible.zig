@@ -587,6 +587,11 @@ pub const OpenAiCompatibleProvider = struct {
         ctx.state.feed(chunk.delta, ctx.downstream, ctx.downstream_ctx);
     }
 
+    fn malformedResponse(detail: []const u8) error{NoResponseContent} {
+        root.setLastApiErrorDetail("compatible", detail);
+        return error.NoResponseContent;
+    }
+
     /// Parse text content from an OpenAI-compatible response.
     pub fn parseTextResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -604,8 +609,12 @@ pub const OpenAiCompatibleProvider = struct {
         }
 
         if (root_obj.get("choices")) |choices| {
+            if (choices != .array) return malformedResponse("Provider response format error: 'choices' is not an array.");
             if (choices.array.items.len > 0) {
-                if (choices.array.items[0].object.get("message")) |msg| {
+                const first = choices.array.items[0];
+                if (first != .object) return malformedResponse("Provider response format error: 'choices[0]' is not an object.");
+                if (first.object.get("message")) |msg| {
+                    if (msg != .object) return malformedResponse("Provider response format error: 'message' is not an object.");
                     if (msg.object.get("content")) |content| {
                         if (content == .string) {
                             return stripThinkBlocks(allocator, content.string);
@@ -615,7 +624,7 @@ pub const OpenAiCompatibleProvider = struct {
             }
         }
 
-        return error.NoResponseContent;
+        return malformedResponse("Provider returned no usable text content.");
     }
 
     /// Parse a native tool-calling response into ChatResponse (OpenAI-compatible format).
@@ -635,8 +644,12 @@ pub const OpenAiCompatibleProvider = struct {
         }
 
         if (root_obj.get("choices")) |choices| {
+            if (choices != .array) return malformedResponse("Provider response format error: 'choices' is not an array.");
             if (choices.array.items.len > 0) {
-                const msg = choices.array.items[0].object.get("message") orelse return error.NoResponseContent;
+                const first = choices.array.items[0];
+                if (first != .object) return malformedResponse("Provider response format error: 'choices[0]' is not an object.");
+                const msg = first.object.get("message") orelse return malformedResponse("Provider response format error: missing 'message'.");
+                if (msg != .object) return malformedResponse("Provider response format error: 'message' is not an object.");
                 const msg_obj = msg.object;
 
                 var content: ?[]const u8 = null;
@@ -667,11 +680,14 @@ pub const OpenAiCompatibleProvider = struct {
                 var tool_calls_list: std.ArrayListUnmanaged(ToolCall) = .empty;
 
                 if (msg_obj.get("tool_calls")) |tc_arr| {
+                    if (tc_arr != .array) return malformedResponse("Provider response format error: 'tool_calls' is not an array.");
                     for (tc_arr.array.items) |tc| {
+                        if (tc != .object) continue;
                         const tc_obj = tc.object;
                         const id = if (tc_obj.get("id")) |i| (if (i == .string) try allocator.dupe(u8, i.string) else try allocator.dupe(u8, "unknown")) else try allocator.dupe(u8, "unknown");
 
                         if (tc_obj.get("function")) |func| {
+                            if (func != .object) continue;
                             const func_obj = func.object;
                             const name = if (func_obj.get("name")) |n| (if (n == .string) try allocator.dupe(u8, n.string) else try allocator.dupe(u8, "")) else try allocator.dupe(u8, "");
                             const arguments = if (func_obj.get("arguments")) |a| (if (a == .string) try allocator.dupe(u8, a.string) else try allocator.dupe(u8, "{}")) else try allocator.dupe(u8, "{}");
@@ -712,7 +728,7 @@ pub const OpenAiCompatibleProvider = struct {
             }
         }
 
-        return error.NoResponseContent;
+        return malformedResponse("Provider returned no usable response payload.");
     }
 
     /// Create a Provider interface from this OpenAiCompatibleProvider.
@@ -1317,6 +1333,17 @@ test "parseNativeResponse reads native reasoning field (Groq/Cerebras parsed for
     try std.testing.expectEqualStrings("parsed reasoning trace", result.reasoning_content.?);
 }
 
+test "parseNativeResponse handles null choices with friendly error detail" {
+    const body =
+        \\{"choices":null,"model":"test-model"}
+    ;
+    root.clearLastApiErrorDetail();
+    try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body));
+    const snap = (try root.snapshotLastApiErrorDetail(std.testing.allocator)).?;
+    defer std.testing.allocator.free(snap);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "choices") != null);
+}
+
 test "buildChatRequestBody emits thinking param for GLM when reasoning_effort set" {
     const allocator = std.testing.allocator;
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
@@ -1461,6 +1488,17 @@ test "parseTextResponse empty choices" {
         \\{"choices":[]}
     ;
     try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
+}
+
+test "parseTextResponse handles null choices with friendly error detail" {
+    const body =
+        \\{"choices":null}
+    ;
+    root.clearLastApiErrorDetail();
+    try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
+    const snap = (try root.snapshotLastApiErrorDetail(std.testing.allocator)).?;
+    defer std.testing.allocator.free(snap);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "choices") != null);
 }
 
 test "parseTextResponse classifies rate-limit errors" {

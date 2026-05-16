@@ -14,6 +14,11 @@ pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, ret_
 
 const log = std.log.scoped(.main);
 
+fn observerFilePath(allocator: std.mem.Allocator, config_path: []const u8) ?[]u8 {
+    const config_dir = std.fs.path.dirname(config_path) orelse return null;
+    return std.fs.path.join(allocator, &.{ config_dir, "observability.jsonl" }) catch null;
+}
+
 const Command = enum {
     agent,
     gateway,
@@ -1899,9 +1904,19 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     defer runtime_provider.deinit();
     const provider_i = runtime_provider.provider();
 
-    // Create noop observer
-    var noop_obs = yc.observability.NoopObserver{};
-    const obs = noop_obs.observer();
+    var obs_backend = yc.observability.ObserverBackend{ .noop = .{} };
+    const obs_path = if (std.mem.eql(u8, config.diagnostics.backend, "file"))
+        observerFilePath(allocator, config.config_path)
+    else
+        null;
+    defer if (obs_path) |path| allocator.free(path);
+    const obs = yc.observability.initObserverBackend(allocator, &obs_backend, .{
+        .backend = config.diagnostics.backend,
+        .file_path = obs_path,
+        .otel_endpoint = config.diagnostics.otel_endpoint,
+        .otel_service_name = config.diagnostics.otel_service_name,
+    });
+    defer obs_backend.deinit();
 
     // Initialize session manager
     var session_mgr = yc.session.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
@@ -2216,9 +2231,19 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         yc.tools.bindMemoryRuntime(tools, rt);
     }
 
-    // Create noop observer
-    var noop_obs = yc.observability.NoopObserver{};
-    const obs = noop_obs.observer();
+    var obs_backend = yc.observability.ObserverBackend{ .noop = .{} };
+    const obs_path = if (std.mem.eql(u8, config.diagnostics.backend, "file"))
+        observerFilePath(allocator, config.config_path)
+    else
+        null;
+    defer if (obs_path) |path| allocator.free(path);
+    const obs = yc.observability.initObserverBackend(allocator, &obs_backend, .{
+        .backend = config.diagnostics.backend,
+        .file_path = obs_path,
+        .otel_endpoint = config.diagnostics.otel_endpoint,
+        .otel_service_name = config.diagnostics.otel_service_name,
+    });
+    defer obs_backend.deinit();
 
     // Create provider with reliability wrapper (retry + fallback chains).
     var runtime_provider = try yc.providers.runtime_bundle.RuntimeProviderBundle.init(allocator, &config);

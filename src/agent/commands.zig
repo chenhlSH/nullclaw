@@ -1008,6 +1008,9 @@ fn formatStatus(self: anytype) ![]const u8 {
     const model_label = if (show_emojis) "🧠 Model" else "Model";
     const history_label = if (show_emojis) "💬 History" else "History";
     const tokens_label = if (show_emojis) "🧮 Tokens used" else "Tokens used";
+    const last_turn_label = if (show_emojis) "📊 Last turn" else "Last turn";
+    const last_usage_label = if (show_emojis) "🧾 Last usage" else "Last usage";
+    const active_tool_label = if (show_emojis) "⏳ Active tool" else "Active tool";
     const tools_label = if (show_emojis) "🔧 Tools" else "Tools";
     const thinking_label = if (show_emojis) "💭 Thinking" else "Thinking";
     const verbose_label = if (show_emojis) "📢 Verbose" else "Verbose";
@@ -1024,6 +1027,27 @@ fn formatStatus(self: anytype) ![]const u8 {
     try w.print("{s}: {s}\n", .{ model_label, self.model_name });
     try w.print("{s}: {d} messages\n", .{ history_label, self.history.items.len });
     try w.print("{s}: {d}\n", .{ tokens_label, self.total_tokens });
+    if (@hasField(@TypeOf(self.*), "last_turn_duration_ms") and
+        @hasField(@TypeOf(self.*), "last_turn_tool_calls") and
+        @hasField(@TypeOf(self.*), "last_turn_tool_failures") and
+        @hasField(@TypeOf(self.*), "last_turn_security_warnings"))
+    {
+        try w.print(
+            "{s}: duration_ms={d} tools={d} failed={d} security_warnings={d}\n",
+            .{ last_turn_label, self.last_turn_duration_ms, self.last_turn_tool_calls, self.last_turn_tool_failures, self.last_turn_security_warnings },
+        );
+    }
+    if (@hasField(@TypeOf(self.*), "last_turn_usage")) {
+        try w.print(
+            "{s}: prompt={d} completion={d} total={d}\n",
+            .{ last_usage_label, self.last_turn_usage.prompt_tokens, self.last_turn_usage.completion_tokens, self.last_turn_usage.total_tokens },
+        );
+    }
+    if (@hasField(@TypeOf(self.*), "active_tool_name")) {
+        if (self.active_tool_name) |name| {
+            try w.print("{s}: {s}\n", .{ active_tool_label, name });
+        }
+    }
     try w.print("{s}: {d} available\n", .{ tools_label, self.tools.len });
     try w.print("{s}: {s}\n", .{ thinking_label, self.reasoning_effort orelse "off" });
     try w.print("{s}: {s}\n", .{ verbose_label, self.verbose_level.toSlice() });

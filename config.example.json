@@ -187,6 +187,22 @@
     "model_fallbacks": []
   },
 
+  "diagnostics": {
+    "backend": "noop",
+    "file_path": "",
+    "log_tool_calls": false,
+    "log_message_receipts": false,
+    "log_message_payloads": false,
+    "log_llm_io": false,
+    "api_error_max_chars": 1024,
+    "token_usage_ledger_enabled": false,
+    "token_usage_ledger_window_hours": 24,
+    "token_usage_ledger_max_bytes": 10485760,
+    "token_usage_ledger_max_lines": 10000,
+    "otel_endpoint": null,
+    "otel_service_name": null
+  },
+
   "autonomy": {
     "level": "supervised",
     "workspace_only": true,

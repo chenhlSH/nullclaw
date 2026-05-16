@@ -186,6 +186,9 @@ pub const VerboseObserver = struct {
             .turn_complete => {
                 stderr.print("< Complete\n", .{}) catch {};
             },
+            .err => |e| {
+                stderr.print("! {s}: {s}\n", .{ e.component, e.message }) catch {};
+            },
             else => {},
         }
     }
@@ -691,6 +694,69 @@ pub const OtelObserver = struct {
         return "otel";
     }
 };
+
+// ── Observer backend helper ─────────────────────────────────────────
+
+pub const ObserverInitOptions = struct {
+    backend: []const u8,
+    file_path: ?[]const u8 = null,
+    otel_endpoint: ?[]const u8 = null,
+    otel_service_name: ?[]const u8 = null,
+};
+
+/// Storage for a single observer backend with stable address.
+pub const ObserverBackend = union(enum) {
+    noop: NoopObserver,
+    log: LogObserver,
+    verbose: VerboseObserver,
+    file: FileObserver,
+    otel: OtelObserver,
+
+    pub fn observer(self: *ObserverBackend) Observer {
+        return switch (self.*) {
+            .noop => |*o| o.observer(),
+            .log => |*o| o.observer(),
+            .verbose => |*o| o.observer(),
+            .file => |*o| o.observer(),
+            .otel => |*o| o.observer(),
+        };
+    }
+
+    pub fn deinit(self: *ObserverBackend) void {
+        switch (self.*) {
+            .otel => |*o| o.deinit(),
+            else => {},
+        }
+    }
+};
+
+/// Initialize an observer backend in-place and return its Observer handle.
+pub fn initObserverBackend(
+    allocator: std.mem.Allocator,
+    backend: *ObserverBackend,
+    options: ObserverInitOptions,
+) Observer {
+    const resolved = createObserver(options.backend);
+    if (std.mem.eql(u8, resolved, "log")) {
+        backend.* = .{ .log = .{} };
+        return backend.observer();
+    }
+    if (std.mem.eql(u8, resolved, "verbose")) {
+        backend.* = .{ .verbose = .{} };
+        return backend.observer();
+    }
+    if (std.mem.eql(u8, resolved, "file")) {
+        backend.* = .{ .file = .{ .path = options.file_path orelse "nullclaw_observer.jsonl" } };
+        return backend.observer();
+    }
+    if (std.mem.eql(u8, resolved, "otel")) {
+        backend.* = .{ .otel = OtelObserver.init(allocator, options.otel_endpoint, options.otel_service_name) };
+        return backend.observer();
+    }
+
+    backend.* = .{ .noop = .{} };
+    return backend.observer();
+}
 
 // ── Tests ────────────────────────────────────────────────────────────
 

@@ -196,6 +196,39 @@ Telegram 示例：
 - `sandbox.backend = "auto"`：自动选择可用隔离后端（如 landlock/firejail/bubblewrap/docker）。
 - `audit.enabled = true`：建议开启审计日志。
 
+### `diagnostics`（诊断与可观测性）
+
+控制运行时的诊断输出与后端。可用于启用轻量日志、终端详细追踪、将事件写成 JSONL 文件，或导出到 OTLP/OTEL。
+
+字段说明：
+
+- `backend`：`noop`、`log`、`verbose`、`file`、`otel` 之一，默认 `noop`。
+- `file_path`：`file` 后端的可选路径；为空时会默认使用配置目录下的 `observability.jsonl`。
+- `log_tool_calls`：是否记录工具调用的开始/结束事件（布尔）。
+- `log_message_receipts`：是否记录渠道消息接收事件（布尔）。
+- `log_message_payloads`：是否在日志中包含消息载荷（注意可能包含敏感数据）。
+- `log_llm_io`：是否记录 LLM 请求/响应的元数据（布尔）。
+- `api_error_max_chars`：截断 provider API 错误信息的字符数上限（整数）。
+- `token_usage_ledger_enabled`：是否启用 token 用量滚动账本（布尔）。
+- `token_usage_ledger_window_hours`：账本窗口小时数（整数）。
+- `token_usage_ledger_max_bytes` / `token_usage_ledger_max_lines`：磁盘账本大小限制。
+- `otel_endpoint` / `otel_service_name`：当 `backend` 为 `otel` 时，可选的 OTLP 端点与服务名。
+
+示例：
+
+```json
+{
+  "diagnostics": {
+    "backend": "file",
+    "file_path": "",
+    "log_tool_calls": true,
+    "log_llm_io": false,
+    "token_usage_ledger_enabled": true,
+    "token_usage_ledger_window_hours": 24
+  }
+}
+```
+
 ### 进阶：Web Search + Full Shell（高风险）
 
 仅在你明确理解风险时使用。示例：

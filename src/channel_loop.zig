@@ -49,6 +49,11 @@ fn setScheduleToolContext(
     }
 }
 
+fn observerFilePath(allocator: std.mem.Allocator, config_path: []const u8) ?[]u8 {
+    const config_dir = std.fs.path.dirname(config_path) orelse return null;
+    return std.fs.path.join(allocator, &.{ config_dir, "observability.jsonl" }) catch null;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Parallel Message Processing
 // ════════════════════════════════════════════════════════════════════════════
@@ -355,7 +360,8 @@ pub const ChannelRuntime = struct {
     tools: []const tools_mod.Tool,
     mem_rt: ?memory_mod.MemoryRuntime,
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
-    noop_obs: *observability.NoopObserver,
+    obs_backend: *observability.ObserverBackend,
+    obs_file_path: ?[]u8,
     subagent_manager: ?*subagent_mod.SubagentManager,
     policy_tracker: *security.RateTracker,
     security_policy: *security.SecurityPolicy,
@@ -445,11 +451,23 @@ pub const ChannelRuntime = struct {
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
-        // Noop observer (heap for vtable stability)
-        const noop_obs = try allocator.create(observability.NoopObserver);
-        errdefer allocator.destroy(noop_obs);
-        noop_obs.* = .{};
-        const obs = noop_obs.observer();
+        const obs_backend = try allocator.create(observability.ObserverBackend);
+        errdefer allocator.destroy(obs_backend);
+        obs_backend.* = .{ .noop = .{} };
+        errdefer obs_backend.deinit();
+
+        const obs_path = if (std.mem.eql(u8, config.diagnostics.backend, "file"))
+            observerFilePath(allocator, config.config_path)
+        else
+            null;
+        errdefer if (obs_path) |path| allocator.free(path);
+
+        const obs = observability.initObserverBackend(allocator, obs_backend, .{
+            .backend = config.diagnostics.backend,
+            .file_path = obs_path,
+            .otel_endpoint = config.diagnostics.otel_endpoint,
+            .otel_service_name = config.diagnostics.otel_service_name,
+        });
 
         // Session manager
         var session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
@@ -465,7 +483,8 @@ pub const ChannelRuntime = struct {
             .tools = tools,
             .mem_rt = mem_rt,
             .bootstrap_provider = bootstrap_provider,
-            .noop_obs = noop_obs,
+            .obs_backend = obs_backend,
+            .obs_file_path = obs_path,
             .subagent_manager = subagent_manager,
             .policy_tracker = policy_tracker,
             .security_policy = security_policy,
@@ -494,7 +513,9 @@ pub const ChannelRuntime = struct {
         self.policy_tracker.deinit();
         alloc.destroy(self.security_policy);
         alloc.destroy(self.policy_tracker);
-        alloc.destroy(self.noop_obs);
+        if (self.obs_file_path) |path| alloc.free(path);
+        self.obs_backend.deinit();
+        alloc.destroy(self.obs_backend);
         alloc.destroy(self);
     }
 };

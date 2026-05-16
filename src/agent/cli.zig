@@ -93,6 +93,11 @@ fn maybePrintLastProviderApiError(
     }
 }
 
+fn observerFilePath(allocator: std.mem.Allocator, cfg: *const Config) ?[]u8 {
+    const config_dir = std.fs.path.dirname(cfg.config_path) orelse return null;
+    return std.fs.path.join(allocator, &.{ config_dir, "observability.jsonl" }) catch null;
+}
+
 const ParsedAgentArgs = struct {
     message_arg: ?[]const u8 = null,
     session_id: ?[]const u8 = null,
@@ -201,9 +206,19 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     const message_arg = parsed_args.message_arg;
     const session_id = parsed_args.session_id;
 
-    // Create a noop observer
-    var noop = observability.NoopObserver{};
-    const obs = noop.observer();
+    var obs_backend = observability.ObserverBackend{ .noop = .{} };
+    const obs_path = if (std.mem.eql(u8, cfg.diagnostics.backend, "file"))
+        observerFilePath(allocator, &cfg)
+    else
+        null;
+    defer if (obs_path) |path| allocator.free(path);
+    const obs = observability.initObserverBackend(allocator, &obs_backend, .{
+        .backend = cfg.diagnostics.backend,
+        .file_path = obs_path,
+        .otel_endpoint = cfg.diagnostics.otel_endpoint,
+        .otel_service_name = cfg.diagnostics.otel_service_name,
+    });
+    defer obs_backend.deinit();
 
     // Record agent start
     const start_event = ObserverEvent{ .agent_start = .{

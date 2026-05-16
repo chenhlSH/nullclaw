@@ -391,7 +391,7 @@ pub fn freeSkills(allocator: std.mem.Allocator, skills_slice: []Skill) void {
 pub fn checkRequirements(allocator: std.mem.Allocator, skill: *Skill) void {
     var missing: std.ArrayListUnmanaged(u8) = .empty;
 
-    // Check required binaries via `which`
+    // Check required binaries via `which`/`where`
     for (skill.requires_bins) |bin| {
         const found = checkBinaryExists(allocator, bin);
         if (!found) {
@@ -423,9 +423,10 @@ pub fn checkRequirements(allocator: std.mem.Allocator, skill: *Skill) void {
     }
 }
 
-/// Check if a binary exists on PATH using `which`.
+/// Check if a binary exists on PATH using `which`/`where`.
 fn checkBinaryExists(allocator: std.mem.Allocator, bin_name: []const u8) bool {
-    var child = std.process.Child.init(&.{ "which", bin_name }, allocator);
+    const locator_cmd = if (zig_builtin.os.tag == .windows) "where" else "which";
+    var child = std.process.Child.init(&.{ locator_cmd, bin_name }, allocator);
     child.stderr_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
 
@@ -3572,7 +3573,8 @@ test "checkRequirements detects missing env var" {
 
 test "checkBinaryExists finds common binary" {
     const allocator = std.testing.allocator;
-    try std.testing.expect(checkBinaryExists(allocator, "ls"));
+    const common_bin = if (zig_builtin.os.tag == .windows) "where" else "ls";
+    try std.testing.expect(checkBinaryExists(allocator, common_bin));
 }
 
 test "checkBinaryExists returns false for nonexistent binary" {
@@ -3584,11 +3586,18 @@ test "loadSkill reads always field" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const common_bin = if (zig_builtin.os.tag == .windows) "where" else "ls";
 
     {
         const f = try tmp.dir.createFile("skill.json", .{});
         defer f.close();
-        try f.writeAll("{\"name\": \"always-skill\", \"always\": true, \"requires_bins\": [\"ls\"]}");
+        const skill_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"name\": \"always-skill\", \"always\": true, \"requires_bins\": [\"{s}\"]}}",
+            .{common_bin},
+        );
+        defer allocator.free(skill_json);
+        try f.writeAll(skill_json);
     }
 
     const skill_dir = try tmp.dir.realpathAlloc(allocator, ".");
@@ -3599,7 +3608,7 @@ test "loadSkill reads always field" {
 
     try std.testing.expect(skill.always);
     try std.testing.expectEqual(@as(usize, 1), skill.requires_bins.len);
-    try std.testing.expectEqualStrings("ls", skill.requires_bins[0]);
+    try std.testing.expectEqualStrings(common_bin, skill.requires_bins[0]);
     try std.testing.expectEqualStrings(skill_dir, skill.path);
 }
 

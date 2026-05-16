@@ -25,6 +25,7 @@ const platform = @import("../platform.zig");
 const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
+const ObserverMetric = observability.ObserverMetric;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
 const verbose_mod = @import("../verbose.zig");
 
@@ -301,6 +302,14 @@ pub const Agent = struct {
     activation_mode: ActivationMode = .mention,
     send_mode: SendMode = .inherit,
     last_turn_usage: providers.TokenUsage = .{},
+    last_turn_duration_ms: u64 = 0,
+    last_turn_tool_calls: u32 = 0,
+    last_turn_tool_failures: u32 = 0,
+    last_turn_security_warnings: u32 = 0,
+    turn_tool_calls: u32 = 0,
+    turn_tool_failures: u32 = 0,
+    turn_security_warnings: u32 = 0,
+    turn_started_ms: i64 = 0,
     status_show_emojis: bool = true,
     message_timeout_secs: u64 = 0,
     log_tool_calls: bool = false,
@@ -547,6 +556,77 @@ pub const Agent = struct {
         }
         return null;
     }
+
+    const PROGRESS_TICK_MS: u64 = 10_000;
+    const PROGRESS_POLL_MS: u64 = 500;
+
+    fn shouldEmitProgress(self: *const Agent) bool {
+        if (builtin.is_test) return false;
+        if (self.verbose_level != .off) return true;
+        if (verbose_mod.isVerbose()) return true;
+        return std.mem.eql(u8, self.observer.getName(), "verbose");
+    }
+
+    fn noteSecurityWarning(self: *Agent, message: []const u8) void {
+        self.turn_security_warnings +|= 1;
+        const warn_event = ObserverEvent{ .err = .{ .component = "security", .message = message } };
+        self.observer.recordEvent(&warn_event);
+    }
+
+    fn finalizeTurnStats(self: *Agent) void {
+        const now_ms = std.time.milliTimestamp();
+        if (self.turn_started_ms > 0) {
+            const duration_ms = @as(u64, @intCast(@max(0, now_ms - self.turn_started_ms)));
+            self.last_turn_duration_ms = duration_ms;
+        } else {
+            self.last_turn_duration_ms = 0;
+        }
+        self.last_turn_tool_calls = self.turn_tool_calls;
+        self.last_turn_tool_failures = self.turn_tool_failures;
+        self.last_turn_security_warnings = self.turn_security_warnings;
+    }
+
+    const ProgressTicker = struct {
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        start_ms: i64 = 0,
+        interval_ms: u64 = PROGRESS_TICK_MS,
+        kind: []const u8 = "",
+        label: []const u8 = "",
+        thread: ?std.Thread = null,
+
+        fn start(self: *ProgressTicker, kind: []const u8, label: []const u8, interval_ms: u64) void {
+            self.start_ms = std.time.milliTimestamp();
+            self.interval_ms = interval_ms;
+            self.kind = kind;
+            self.label = label;
+            self.thread = std.Thread.spawn(.{}, ProgressTicker.run, .{self}) catch null;
+        }
+
+        fn stopAndJoin(self: *ProgressTicker) void {
+            if (self.thread) |t| {
+                self.stop.store(true, .release);
+                t.join();
+                self.thread = null;
+            }
+        }
+
+        fn run(self: *ProgressTicker) void {
+            var elapsed_ms: u64 = 0;
+            while (!self.stop.load(.acquire)) {
+                std.Thread.sleep(PROGRESS_POLL_MS * std.time.ns_per_ms);
+                if (self.stop.load(.acquire)) break;
+                elapsed_ms +|= PROGRESS_POLL_MS;
+                if (elapsed_ms < self.interval_ms) continue;
+                elapsed_ms = 0;
+                const now_ms = std.time.milliTimestamp();
+                const total_ms: u64 = @as(u64, @intCast(@max(0, now_ms - self.start_ms)));
+                var buf: [256]u8 = undefined;
+                var bw = std.fs.File.stderr().writer(&buf);
+                const w = &bw.interface;
+                w.print("... {s} {s} running (elapsed={d}s)\n", .{ self.kind, self.label, total_ms / 1000 }) catch {};
+            }
+        }
+    };
 
     fn interruptedReply(self: *Agent) ![]const u8 {
         self.clearInterruptRequest();
@@ -1472,6 +1552,11 @@ pub const Agent = struct {
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         self.context_was_compacted = false;
+        self.turn_tool_calls = 0;
+        self.turn_tool_failures = 0;
+        self.turn_security_warnings = 0;
+        self.turn_started_ms = std.time.milliTimestamp();
+        defer self.finalizeTurnStats();
         commands.refreshSubagentToolContext(self);
 
         const turn_input = commands.planTurnInput(user_message);
@@ -1917,6 +2002,11 @@ pub const Agent = struct {
             }
             response.usage = normalized_usage;
 
+            if (normalized_usage.total_tokens > 0) {
+                const metric = ObserverMetric{ .tokens_used = normalized_usage.total_tokens };
+                self.observer.recordMetric(&metric);
+            }
+
             self.total_tokens += normalized_usage.total_tokens;
             self.last_turn_usage = normalized_usage;
             self.emitUsageRecord(&response, true);
@@ -2127,6 +2217,8 @@ pub const Agent = struct {
                     return self.interruptedReply();
                 }
 
+                self.turn_tool_calls +|= 1;
+
                 if (self.log_tool_calls) {
                     log.info(
                         "tool-call start session=0x{x} index={d} name={s} id={s}",
@@ -2148,6 +2240,10 @@ pub const Agent = struct {
                 else
                     self.executeTool(arena, call);
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
+
+                if (!result.success) {
+                    self.turn_tool_failures +|= 1;
+                }
 
                 if (self.log_tool_calls) {
                     log.info(
@@ -2352,6 +2448,7 @@ pub const Agent = struct {
         // Policy gate: check autonomy and rate limit
         if (self.policy) |pol| {
             if (!pol.canAct()) {
+                self.noteSecurityWarning("Action blocked: agent is in read-only mode");
                 return .{
                     .name = call.name,
                     .output = "Action blocked: agent is in read-only mode",
@@ -2361,6 +2458,7 @@ pub const Agent = struct {
             }
             const allowed = pol.recordAction() catch true;
             if (!allowed) {
+                self.noteSecurityWarning("Rate limit exceeded");
                 return .{
                     .name = call.name,
                     .output = "Rate limit exceeded",
@@ -2404,6 +2502,7 @@ pub const Agent = struct {
 
                 if (isExecToolName(call.name)) {
                     if (self.execBlockMessage(args)) |msg| {
+                        self.noteSecurityWarning(msg);
                         return .{
                             .name = call.name,
                             .output = msg,
@@ -2415,6 +2514,11 @@ pub const Agent = struct {
 
                 self.setActiveToolName(trimmed_call_name) catch {};
                 defer self.clearActiveToolName();
+                var progress: ProgressTicker = .{};
+                if (self.shouldEmitProgress()) {
+                    progress.start("tool", trimmed_call_name, PROGRESS_TICK_MS);
+                    defer progress.stopAndJoin();
+                }
                 tools_mod.process_util.setThreadInterruptFlag(&self.interrupt_requested);
                 defer tools_mod.process_util.setThreadInterruptFlag(null);
                 @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);

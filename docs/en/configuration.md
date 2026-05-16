@@ -212,6 +212,39 @@ Avoid direct public exposure. Use tunnel when external access is required.
 - `sandbox.backend = "auto"`: auto-selects an available sandbox backend.
 - `audit.enabled = true`: recommended for traceability.
 
+### `diagnostics`
+
+Controls runtime observability and diagnostic backends. Use this to enable lightweight logging, verbose runtime traces, write JSONL events to disk, or export to OTLP/OTEL.
+
+Fields:
+
+- `backend`: one of `noop`, `log`, `verbose`, `file`, `otel`. Default: `noop`.
+- `file_path`: optional path for `file` backend. If empty, it defaults to `<config_dir>/observability.jsonl`.
+- `log_tool_calls`: boolean — whether to log tool call start/end events.
+- `log_message_receipts`: boolean — whether to log channel message receipt events.
+- `log_message_payloads`: boolean — whether to include message payloads in logs (careful with sensitive data).
+- `log_llm_io`: boolean — whether to log LLM request/response metadata.
+- `api_error_max_chars`: integer — truncate provider API error payloads to this many characters.
+- `token_usage_ledger_enabled`: boolean — maintain a rolling ledger of token usage for diagnostic windows.
+- `token_usage_ledger_window_hours`: integer — window length for token ledger in hours.
+- `token_usage_ledger_max_bytes` / `token_usage_ledger_max_lines`: limits for on-disk ledger size.
+- `otel_endpoint` / `otel_service_name`: optional OTLP endpoint and service name when `backend` is `otel`.
+
+Example:
+
+```json
+{
+  "diagnostics": {
+    "backend": "file",
+    "file_path": "",
+    "log_tool_calls": true,
+    "log_llm_io": false,
+    "token_usage_ledger_enabled": true,
+    "token_usage_ledger_window_hours": 24
+  }
+}
+```
+
 ### Advanced: Web Search + Full Shell (high risk)
 
 Use only in controlled environments:
