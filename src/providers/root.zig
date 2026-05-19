@@ -48,11 +48,6 @@ pub const compatibleProviderDisplayName = factory.compatibleProviderDisplayName;
 pub const ProviderHolder = factory.ProviderHolder;
 
 // Re-exports from helpers.zig
-pub const complete = helpers.complete;
-pub const completeWithSystem = helpers.completeWithSystem;
-pub const providerUrl = helpers.providerUrl;
-pub const buildRequestBody = helpers.buildRequestBody;
-pub const buildRequestBodyWithSystem = helpers.buildRequestBodyWithSystem;
 pub const isReasoningModel = helpers.isReasoningModel;
 pub const appendGenerationFields = helpers.appendGenerationFields;
 pub const appendGeminiThinkingConfig = helpers.appendGeminiThinkingConfig;
@@ -64,7 +59,6 @@ pub const convertToolsAnthropic = helpers.convertToolsAnthropic;
 pub const convertToolsResponses = helpers.convertToolsResponses;
 pub const curlPostTimed = helpers.curlPostTimed;
 pub const curlPostFormTimed = helpers.curlPostFormTimed;
-pub const extractContent = helpers.extractContent;
 pub const SplitThinkContent = helpers.SplitThinkContent;
 pub const splitThinkContent = helpers.splitThinkContent;
 pub const stripThinkBlocks = helpers.stripThinkBlocks;
