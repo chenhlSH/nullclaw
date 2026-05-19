@@ -31,10 +31,6 @@ pub const AuditLog = struct {
         if (std.fs.path.dirname(self.path)) |dir| {
             fs_compat.makePath(dir) catch {};
         }
-        const file = try fs_compat.createPath(self.path, .{ .truncate = false });
-        defer file.close();
-        try file.seekFromEnd(0);
-
         const ts: i64 = std_compat.time.timestamp();
         const severity_escaped = try jsonEscape(self.allocator, verdict.severity_adjusted);
         defer self.allocator.free(severity_escaped);
@@ -54,7 +50,7 @@ pub const AuditLog = struct {
             },
         );
         defer self.allocator.free(line);
-        try file.writeAll(line);
+        try fs_compat.appendBytes(self.path, line);
     }
 };
 
